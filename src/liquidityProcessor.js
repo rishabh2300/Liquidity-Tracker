@@ -22,28 +22,50 @@ const extractArray = (input) => {
 // File parsing — handles both CSV and Excel (.xlsx / .xlsm)
 // -----------------------------------------------------------------------------
 
+/** Returns the name of the first sheet in an Excel file, or null for CSV. */
+export function getFirstSheetName(file) {
+  return new Promise((resolve) => {
+    const name = (file.name || '').toLowerCase();
+    const isExcel = name.endsWith('.xlsx') || name.endsWith('.xlsm') || name.endsWith('.xls');
+    if (!isExcel) { resolve(null); return; }
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const wb = XLSX.read(new Uint8Array(e.target.result), { type: 'array' });
+        resolve(wb.SheetNames[0] ?? null);
+      } catch { resolve(null); }
+    };
+    reader.onerror = () => resolve(null);
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+/**
+ * Parses a CSV or Excel file.
+ *   - CSV        → resolves to a flat array of row objects.
+ *   - Excel      → resolves to an object keyed by sheet name, each value being
+ *                  a flat array of row objects. Callers that expect a single
+ *                  sheet should pick the first key or a known sheet name.
+ */
 export function parseFile(file) {
   return new Promise((resolve, reject) => {
     const name = (file.name || '').toLowerCase();
     const isExcel = name.endsWith('.xlsx') || name.endsWith('.xlsm') || name.endsWith('.xls');
-
-    const finish = (rows, source) => {
-      if (!Array.isArray(rows)) {
-        reject(new Error(`Parser for "${file.name}" returned a non-array (${source}).`));
-        return;
-      }
-      resolve(rows);
-    };
 
     if (isExcel) {
       const reader = new FileReader();
       reader.onload = (e) => {
         try {
           const data = new Uint8Array(e.target.result);
-          const workbook = XLSX.read(data, { type: 'array' });
-          const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-          const rows = XLSX.utils.sheet_to_json(firstSheet, { defval: '', raw: false });
-          finish(rows, 'xlsx');
+          const wb = XLSX.read(data, { type: 'array' });
+          const sheets = {};
+          wb.SheetNames.forEach((sheetName) => {
+            sheets[sheetName] = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], {
+              defval: '',
+              raw: false,
+            });
+          });
+          resolve(sheets);
         } catch (err) {
           reject(new Error(`Failed to parse Excel file "${file.name}": ${err.message}`));
         }
@@ -63,7 +85,7 @@ export function parseFile(file) {
             return;
           }
         }
-        finish(results.data, 'csv');
+        resolve(results.data);
       },
       error: (err) => reject(new Error(`Failed to parse "${file.name}": ${err.message}`)),
     });
@@ -202,6 +224,40 @@ function reshapeByHeaderRow(rows, requiredHeaders) {
 // -----------------------------------------------------------------------------
 
 const MASTER_COLS = ['WS Client Code', 'Client Name', 'RM Name', 'ICICI Acc. No.'];
+
+/**
+ * Bank recon files use different column names for account/balance.
+ * Remaps known alternatives to the canonical CA column names so the rest of
+ * the pipeline doesn't need to know about the source format.
+ *   Account Number  ← "Bank Account" or any key containing "account"
+ *   Available Balance ← "Sum of Bank Balance (Custody)" preferred,
+ *                       then "(System)", then any key containing "balance"
+ */
+function normalizeCAColumns(rows) {
+  if (!rows.length) return rows;
+  const keys = Object.keys(rows[0]);
+  const lc = (k) => k.toLowerCase();
+
+  const hasCol = (name) => keys.some((k) => lc(k) === lc(name));
+  if (hasCol('Account Number') && hasCol('Available Balance')) return rows;
+
+  const acctKey =
+    keys.find((k) => lc(k) === 'bank account') ??
+    keys.find((k) => lc(k).includes('account'));
+
+  const balKey =
+    keys.find((k) => lc(k) === 'sum of bank balance (custody)') ??
+    keys.find((k) => lc(k) === 'sum of bank balance (system)') ??
+    keys.find((k) => lc(k).includes('balance'));
+
+  if (!acctKey || !balKey) return rows;
+
+  return rows.map((row) => ({
+    ...row,
+    'Account Number': row[acctKey],
+    'Available Balance': row[balKey],
+  }));
+}
 const Z10_COLS = ['WS CLIENT ID', 'SECURITY TYPE DESCRIPTION', 'ASTCLSNAME', 'MKTVALUE'];
 const CA_COLS = ['Account Number', 'Available Balance'];
 
@@ -210,7 +266,7 @@ const CA_COLS = ['Account Number', 'Available Balance'];
  * Z10 contributes Liquid MF balances (Mutual Funds + Cash only).
  * Current Account Data contributes ICICI cash balances.
  */
-export function buildDailyTracker(masterRows, z10Rows, caRows) {
+export function buildDailyTracker(masterRows, z10Rows, caRows, masterMeta = {}) {
   const safeMaster = extractArray(masterRows);
   const safeZ10 = extractArray(z10Rows);
   const safeCa = extractArray(caRows);
@@ -221,10 +277,11 @@ export function buildDailyTracker(masterRows, z10Rows, caRows) {
   // CA files from bank exports often have title rows before the real header.
   // Try to locate the "Account Number" header row dynamically; fall back to
   // the raw rows if they already carry the correct column names.
-  const reshapedCa = reshapeByHeaderRow(safeCa, CA_COLS) ?? safeCa;
+  const reshapedCa = normalizeCAColumns(reshapeByHeaderRow(safeCa, CA_COLS) ?? safeCa);
   assertColumns(reshapedCa, CA_COLS, 'Current Account Data');
 
   const warnings = [];
+  const exceptions = [];
   const liquidMfBalances = buildLiquidMfBalances(safeZ10);
   const caMapping = buildCurrentAccountMapping(reshapedCa);
 
@@ -232,17 +289,45 @@ export function buildDailyTracker(masterRows, z10Rows, caRows) {
   let clientsWithoutRm = 0;
   let clientsWithoutIcici = 0;
 
-  for (const mRow of safeMaster) {
+  safeMaster.forEach((mRow, index) => {
     const clientCode = str(mRow['WS Client Code']);
-    if (!clientCode) continue;
+    if (!clientCode) return;
 
+    const excelRow = index + 2;
     const rmName = str(mRow['RM Name']);
     const iciciAccount = normalizeAccount(mRow['ICICI Acc. No.']);
     const iciciBalance = caMapping[iciciAccount] || 0;
     const liquidMf = liquidMfBalances[clientCode] || 0;
 
-    if (!rmName) clientsWithoutRm += 1;
-    if (!iciciAccount || !(iciciAccount in caMapping)) clientsWithoutIcici += 1;
+    const baseMeta = {
+      'Source File': masterMeta.fileName || '',
+      'Sheet Name': masterMeta.sheetName || '',
+    };
+
+    if (!rmName) {
+      clientsWithoutRm += 1;
+      exceptions.push({
+        'Issue': 'Missing RM Name',
+        'Master Row': excelRow,
+        ...baseMeta,
+        'Client Code': clientCode,
+        'Client Name': str(mRow['Client Name']),
+        'RM Name': '',
+        'ICICI Acc. No.': iciciAccount,
+      });
+    }
+    if (!iciciAccount || !(iciciAccount in caMapping)) {
+      clientsWithoutIcici += 1;
+      exceptions.push({
+        'Issue': 'Missing Current Account Balance',
+        'Master Row': excelRow,
+        ...baseMeta,
+        'Client Code': clientCode,
+        'Client Name': str(mRow['Client Name']),
+        'RM Name': rmName,
+        'ICICI Acc. No.': iciciAccount,
+      });
+    }
 
     rows.push({
       'RM Name': rmName,
@@ -253,7 +338,7 @@ export function buildDailyTracker(masterRows, z10Rows, caRows) {
       'Liquid MF Balance': liquidMf,
       'Total Liquidity': iciciBalance + liquidMf,
     });
-  }
+  });
 
   rows.sort((a, b) => {
     const rmA = a['RM Name'];
@@ -279,14 +364,15 @@ export function buildDailyTracker(masterRows, z10Rows, caRows) {
     warnings.push(`${clientsWithoutIcici} client(s) had no matching Current Account balance.`);
   }
 
-  return { rows, summary, warnings };
+  return { rows, summary, warnings, exceptions, generatedAt: new Date() };
 }
 
 // -----------------------------------------------------------------------------
 // Tab 2 — Update Master (diff against Bank Recon)
 // -----------------------------------------------------------------------------
 
-const RECON_COLS = ['Bank Code', 'Client Name', 'Bank Account'];
+const RECON_COLS_V1 = ['Bank Code', 'Client Name', 'Bank Account'];
+const RECON_COLS_V2 = ['CLIENT_CODE', 'CLIENTNAME', 'BANK_ACCOUNT'];
 
 /**
  * Applies Bank Recon updates to the Client Master.
@@ -302,7 +388,13 @@ export function buildUpdatedMaster(masterRows, reconRows) {
   const safeRecon = extractArray(reconRows);
 
   assertColumns(safeMaster, MASTER_COLS, 'Client Master');
-  assertColumns(safeRecon, RECON_COLS, 'Bank Recon');
+
+  // Accept either the legacy header format (Bank Code / Client Name / Bank Account)
+  // or the export format (CLIENT_CODE / CLIENTNAME / BANK_ACCOUNT).
+  const presentKeys = safeRecon.length > 0 ? Object.keys(safeRecon[0]) : [];
+  const presentLower = new Set(presentKeys.map((k) => k.toLowerCase()));
+  const usesV2Headers = presentLower.has('client_code');
+  assertColumns(safeRecon, usesV2Headers ? RECON_COLS_V2 : RECON_COLS_V1, 'Bank Recon');
 
   const byCode = new Map();
   for (const m of safeMaster) {
@@ -317,15 +409,48 @@ export function buildUpdatedMaster(masterRows, reconRows) {
     });
   }
 
-  let added = 0;
-  let updated = 0;
-
+  // Pre-pass: count occurrences of each Bank Code to detect duplicates.
+  const reconCodeCount = new Map();
   for (const r of safeRecon) {
     const code = str(getField(r, 'Bank Code', 'CLIENT_CODE'));
     if (!code) continue;
+    reconCodeCount.set(code, (reconCodeCount.get(code) || 0) + 1);
+  }
 
+  let added = 0;
+  let updated = 0;
+  const mappingReport = [];
+
+  for (const r of safeRecon) {
+    const code = str(getField(r, 'Bank Code', 'CLIENT_CODE'));
     const reconAccount = normalizeAccount(getField(r, 'Bank Account', 'BANK_ACCOUNT'));
     const reconName = str(getField(r, 'Client Name', 'CLIENTNAME'));
+
+    const reportRow = {
+      'Recon Client Code': code,
+      'Recon Client Name': reconName,
+      'Recon Bank Account': reconAccount,
+      'Mapping Status': '',
+      'Action Taken': '',
+      'Detailed Note': '',
+    };
+
+    if (!code) {
+      reportRow['Mapping Status'] = 'Error: Missing Client Code';
+      reportRow['Action Taken'] = 'Skipped';
+      reportRow['Detailed Note'] = 'Row has no client code — cannot map to Master';
+      mappingReport.push(reportRow);
+      continue;
+    }
+
+    const count = reconCodeCount.get(code);
+    if (count > 1) {
+      reportRow['Mapping Status'] = 'Error: Duplicate Client Code';
+      reportRow['Action Taken'] = 'Skipped — Duplicate';
+      reportRow['Detailed Note'] = `Client Code appears ${count} times in the Recon file; manual review required`;
+      mappingReport.push(reportRow);
+      continue;
+    }
 
     if (!byCode.has(code)) {
       byCode.set(code, {
@@ -336,15 +461,30 @@ export function buildUpdatedMaster(masterRows, reconRows) {
         Status: 'New',
       });
       added += 1;
+      reportRow['Mapping Status'] = 'Unmapped';
+      reportRow['Action Taken'] = 'Added to Master as New';
+      reportRow['Detailed Note'] = 'Client Code not found in existing Master; added with blank RM Name';
+      mappingReport.push(reportRow);
       continue;
     }
 
     const existing = byCode.get(code);
     if (reconAccount && existing['ICICI Acc. No.'] !== reconAccount) {
+      const oldAccount = existing['ICICI Acc. No.'] || '(blank)';
       existing['ICICI Acc. No.'] = reconAccount;
       existing.Status = 'Updated';
       updated += 1;
+      reportRow['Mapping Status'] = 'Mapped';
+      reportRow['Action Taken'] = 'Updated Existing Master Account';
+      reportRow['Detailed Note'] = `Account changed from ${oldAccount} to ${reconAccount}`;
+    } else {
+      reportRow['Mapping Status'] = 'Mapped';
+      reportRow['Action Taken'] = 'No Change (Already up-to-date)';
+      reportRow['Detailed Note'] = reconAccount
+        ? 'Recon account matches existing Master — no update needed'
+        : 'No account number in Recon row; existing Master value kept';
     }
+    mappingReport.push(reportRow);
   }
 
   const rows = Array.from(byCode.values()).sort((a, b) =>
@@ -353,6 +493,8 @@ export function buildUpdatedMaster(masterRows, reconRows) {
 
   return {
     rows,
+    mappingReport,
+    generatedAt: new Date(),
     summary: {
       totalRecords: rows.length,
       added,
@@ -453,6 +595,52 @@ export async function exportDailyTrackerZip(rows, summary) {
   }
 
   return zip.generateAsync({ type: 'blob' });
+}
+
+const EXCEPTIONS_HEADER = ['Issue', 'Master Row', 'Source File', 'Sheet Name', 'Client Code', 'Client Name', 'RM Name', 'ICICI Acc. No.'];
+const EXCEPTIONS_COL_WIDTHS = [{ wch: 32 }, { wch: 12 }, { wch: 30 }, { wch: 20 }, { wch: 16 }, { wch: 36 }, { wch: 28 }, { wch: 20 }];
+
+function appendReportInfoSheet(wb, generatedAt) {
+  const infoSheet = XLSX.utils.json_to_sheet([
+    { Field: 'Generated At', Value: (generatedAt || new Date()).toLocaleString('en-IN', { dateStyle: 'full', timeStyle: 'short' }) },
+    { Field: 'Generated By', Value: 'Onza Liquidity Tracker' },
+  ]);
+  infoSheet['!cols'] = [{ wch: 20 }, { wch: 40 }];
+  XLSX.utils.book_append_sheet(wb, infoSheet, 'Report Info');
+}
+
+export function exportExceptionsToXlsx(exceptions, generatedAt) {
+  const wb = XLSX.utils.book_new();
+  const sheet = XLSX.utils.json_to_sheet(exceptions, { header: EXCEPTIONS_HEADER });
+  sheet['!cols'] = EXCEPTIONS_COL_WIDTHS;
+  XLSX.utils.book_append_sheet(wb, sheet, 'Exceptions');
+  appendReportInfoSheet(wb, generatedAt);
+  return XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+}
+
+const MAPPING_REPORT_HEADER = [
+  'Recon Client Code',
+  'Recon Client Name',
+  'Recon Bank Account',
+  'Mapping Status',
+  'Action Taken',
+  'Detailed Note',
+];
+
+const MAPPING_REPORT_COL_WIDTHS = [
+  { wch: 20 }, { wch: 36 }, { wch: 20 }, { wch: 30 }, { wch: 36 }, { wch: 60 },
+];
+
+/**
+ * Single-workbook export of the detailed mapping report.
+ */
+export function exportMappingReportToXlsx(mappingReport, generatedAt) {
+  const wb = XLSX.utils.book_new();
+  const sheet = XLSX.utils.json_to_sheet(mappingReport, { header: MAPPING_REPORT_HEADER });
+  sheet['!cols'] = MAPPING_REPORT_COL_WIDTHS;
+  XLSX.utils.book_append_sheet(wb, sheet, 'Mapping Report');
+  appendReportInfoSheet(wb, generatedAt);
+  return XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
 }
 
 /**

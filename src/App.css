@@ -151,6 +151,12 @@ h1, h2, h3, h4, h5, h6 {
   font-weight: 700;
 }
 
+.panel-meta {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
 .panel-empty {
   text-align: center;
   padding: 64px 32px;
@@ -211,6 +217,16 @@ h1, h2, h3, h4, h5, h6 {
 
 .file-grid-2 {
   grid-template-columns: repeat(2, 1fr);
+}
+
+.file-grid-4 {
+  grid-template-columns: repeat(4, 1fr);
+}
+
+@media (max-width: 900px) {
+  .file-grid-4 {
+    grid-template-columns: repeat(2, 1fr);
+  }
 }
 
 .file-slot {
@@ -366,6 +382,26 @@ h1, h2, h3, h4, h5, h6 {
   background: #FFFBE6;
   color: #D48806;
   border: 1px solid #FFE58F;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.alert-warn-body {
+  flex: 1;
+}
+
+.btn-warn {
+  background: #FAAD14;
+  color: #fff;
+  border: none;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.btn-warn:hover:not(:disabled) {
+  background: #D48806;
 }
 
 /* --- Summary Cards --- */
