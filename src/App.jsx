@@ -134,7 +134,10 @@ export default function App() {
 
   const handleExportMaster = () => {
     if (!masterResult) return;
-    const exportRows = masterResult.rows.map(({ Status, ...rest }) => rest);
+    // Prefer the daily-tracker's finalMasterRows so Z10-only clients
+    // (auto-added during the pipeline) are included in the export.
+    const sourceRows = result?.finalMasterRows ?? masterResult.rows;
+    const exportRows = sourceRows.map(({ Status, ...rest }) => rest);
     const buffer = exportMasterToXlsx(exportRows);
     const blob = new Blob([buffer], {
       type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',

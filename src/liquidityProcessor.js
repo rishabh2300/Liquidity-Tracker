@@ -12,9 +12,24 @@ import Papa from 'papaparse';
 import * as XLSX from 'xlsx';
 import JSZip from 'jszip';
 
-const extractArray = (input) => {
+/**
+ * Resolves input to a flat row array.
+ *   - Already an array                → returned as-is.
+ *   - Multi-sheet Excel object        → tries each name in preferredSheets,
+ *                                       then falls back to the first sheet.
+ *   - PapaParse result ({ data: [] }) → extracts .data.
+ *   - Anything else                   → empty array.
+ */
+const extractArray = (input, preferredSheets = []) => {
   if (Array.isArray(input)) return input;
   if (input && Array.isArray(input.data)) return input.data;
+  if (input && typeof input === 'object') {
+    for (const name of preferredSheets) {
+      if (Array.isArray(input[name])) return input[name];
+    }
+    const firstKey = Object.keys(input)[0];
+    return firstKey && Array.isArray(input[firstKey]) ? input[firstKey] : [];
+  }
   return [];
 };
 
@@ -153,28 +168,75 @@ function getField(row, ...keys) {
 
 function buildLiquidMfBalances(z10Rows) {
   const balances = {};
+  const names = {};
   for (const row of z10Rows) {
-    const secType = str(getField(row, 'SECURITY TYPE DESCRIPTION', 'Security Type Description'));
-    const astCls = str(getField(row, 'ASTCLSNAME'));
-    if (secType !== 'Mutual Funds' || astCls !== 'Cash') continue;
+    const secType = str(getField(row, 'SECURITY TYPE DESCRIPTION', 'Security Type Description')).toLowerCase();
+    const astCls  = str(getField(row, 'ASTCLSNAME')).toLowerCase();
+    const subCls  = str(getField(row, 'SUBCLSNAME', 'Sub Class Name')).toLowerCase();
+    const scheme  = str(getField(row, 'SCHEMENAME', 'Scheme Name', 'SECURITY NAME', 'Security Name')).toLowerCase();
+
+    // Exclude Alternates, AIFs, and PMS regardless of other classifications.
+    const isExcluded =
+      astCls.includes('alternate') ||
+      astCls.includes('aif') ||
+      astCls.includes('pms') ||
+      subCls.includes('alternate') ||
+      subCls.includes('aif') ||
+      subCls.includes('pms') ||
+      scheme.includes(' aif') ||
+      scheme.includes('alternate investment');
+
+    if (isExcluded) continue;
+
+    // Only count Mutual Fund rows explicitly classified as Cash / Liquid.
+    const isMutualFund = secType === 'mutual funds' || secType === 'mutual fund';
+    const isCashLiquid = astCls === 'cash' || astCls.includes('liquid');
+
+    if (!isMutualFund || !isCashLiquid) continue;
 
     const clientId = str(getField(row, 'WS CLIENT ID', 'WS client id'));
     if (!clientId) continue;
     balances[clientId] = (balances[clientId] || 0) + toNumber(getField(row, 'MKTVALUE'));
+    if (!names[clientId]) {
+      names[clientId] = str(getField(row, 'CLIENT NAME', 'Client Name'));
+    }
   }
-  return balances;
+  return { balances, names };
 }
 
 function buildCurrentAccountMapping(caRows) {
   const mapping = {};
+  // Per-account metadata so orphan rows can show the bank's account name.
+  const accountInfo = {};
+
   for (const row of caRows) {
-    const acct = normalizeAccount(row['Account Number']);
-    if (!acct) continue;
-    if (!(acct in mapping)) {
-      mapping[acct] = toNumber(row['Available Balance']);
+    const raw = str(row['Account Number'] ?? row['ACCOUNT_NUMBER'] ?? row['Account No'] ?? '');
+    if (!raw) continue;
+
+    // Use ?? so a genuine 0 balance is stored, not skipped.
+    const bal = toNumber(
+      row['Effective Balance'] !== undefined && row['Effective Balance'] !== ''
+        ? row['Effective Balance']
+        : row['Available Balance'] !== undefined && row['Available Balance'] !== ''
+          ? row['Available Balance']
+          : row['BALANCE']
+    );
+
+    const accountName = str(row['Account Name'] ?? row['ACCOUNT_NAME'] ?? row['Name'] ?? '');
+
+    // Store under both the zero-padded form and the stripped form so lookups
+    // succeed regardless of whether Excel dropped leading zeros.
+    const padded   = normalizeAccount(raw);
+    const stripped = raw.replace(/^0+/, '') || '0';
+
+    if (padded   && !(padded   in mapping)) mapping[padded]   = bal;
+    if (stripped && !(stripped in mapping)) mapping[stripped] = bal;
+
+    if (padded && !(padded in accountInfo)) {
+      accountInfo[padded] = { balance: bal, accountName, raw };
     }
   }
-  return mapping;
+  return { mapping, accountInfo };
 }
 
 /**
@@ -226,36 +288,55 @@ function reshapeByHeaderRow(rows, requiredHeaders) {
 const MASTER_COLS = ['WS Client Code', 'Client Name', 'RM Name', 'ICICI Acc. No.'];
 
 /**
- * Bank recon files use different column names for account/balance.
- * Remaps known alternatives to the canonical CA column names so the rest of
- * the pipeline doesn't need to know about the source format.
- *   Account Number  ← "Bank Account" or any key containing "account"
- *   Available Balance ← "Sum of Bank Balance (Custody)" preferred,
- *                       then "(System)", then any key containing "balance"
+ * Bank recon files use different column names for account/balance and often
+ * have stray leading/trailing whitespace in the headers (e.g.
+ * " Effective Balance "). This remaps every recognised variant to canonical
+ * keys so the rest of the pipeline can use exact-match lookups.
+ *   Account Number    ← "Account Number" / "Bank Account" / "Account No" / any "account"
+ *   Effective Balance ← "Effective Balance" (preferred for ICICI sheet)
+ *   Available Balance ← "Available Balance" / "Sum of Bank Balance (Custody)" /
+ *                       "(System)" / any "balance"
  */
 function normalizeCAColumns(rows) {
   if (!rows.length) return rows;
   const keys = Object.keys(rows[0]);
-  const lc = (k) => k.toLowerCase();
+  const norm = (k) => k.trim().toLowerCase();
 
-  const hasCol = (name) => keys.some((k) => lc(k) === lc(name));
-  if (hasCol('Account Number') && hasCol('Available Balance')) return rows;
+  const findExact = (...candidates) => {
+    for (const c of candidates) {
+      const target = norm(c);
+      const found = keys.find((k) => norm(k) === target);
+      if (found) return found;
+    }
+    return null;
+  };
 
-  const acctKey =
-    keys.find((k) => lc(k) === 'bank account') ??
-    keys.find((k) => lc(k).includes('account'));
+  const findContains = (substr) => {
+    const s = substr.toLowerCase();
+    return keys.find((k) => norm(k).includes(s)) ?? null;
+  };
 
-  const balKey =
-    keys.find((k) => lc(k) === 'sum of bank balance (custody)') ??
-    keys.find((k) => lc(k) === 'sum of bank balance (system)') ??
-    keys.find((k) => lc(k).includes('balance'));
+  const accountKey =
+    findExact('Account Number', 'Account No', 'ACCOUNT_NUMBER', 'Bank Account') ||
+    findContains('account');
 
-  if (!acctKey || !balKey) return rows;
+  const effectiveKey = findExact('Effective Balance');
+  const availableKey = findExact('Available Balance');
+  const fallbackBalKey =
+    findExact('Sum of Bank Balance (Custody)', 'Sum of Bank Balance (System)') ||
+    findContains('balance');
+
+  if (!accountKey || (!effectiveKey && !availableKey && !fallbackBalKey)) return rows;
 
   return rows.map((row) => ({
     ...row,
-    'Account Number': row[acctKey],
-    'Available Balance': row[balKey],
+    'Account Number': row[accountKey],
+    'Effective Balance': effectiveKey ? row[effectiveKey] : '',
+    'Available Balance': availableKey
+      ? row[availableKey]
+      : fallbackBalKey
+        ? row[fallbackBalKey]
+        : '',
   }));
 }
 const Z10_COLS = ['WS CLIENT ID', 'SECURITY TYPE DESCRIPTION', 'ASTCLSNAME', 'MKTVALUE'];
@@ -269,7 +350,7 @@ const CA_COLS = ['Account Number', 'Available Balance'];
 export function buildDailyTracker(masterRows, z10Rows, caRows, masterMeta = {}) {
   const safeMaster = extractArray(masterRows);
   const safeZ10 = extractArray(z10Rows);
-  const safeCa = extractArray(caRows);
+  const safeCa = extractArray(caRows, ['ICICI Balances', 'ICICI Balance']);
 
   assertColumns(safeMaster, MASTER_COLS, 'Client Master');
   assertColumns(safeZ10, Z10_COLS, 'Z10');
@@ -282,12 +363,22 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, masterMeta = {}) 
 
   const warnings = [];
   const exceptions = [];
-  const liquidMfBalances = buildLiquidMfBalances(safeZ10);
-  const caMapping = buildCurrentAccountMapping(reshapedCa);
+  const { balances: liquidMfBalances, names: z10Names } = buildLiquidMfBalances(safeZ10);
+  const { mapping: caMapping, accountInfo: caAccountInfo } = buildCurrentAccountMapping(reshapedCa);
+
+  // Carry the master forward so any auto-added clients (Z10 orphans) flow
+  // into the exported "Updated Client Master" too.
+  const finalMasterRows = safeMaster.map((r) => ({ ...r }));
 
   const rows = [];
   let clientsWithoutRm = 0;
   let clientsWithoutIcici = 0;
+  const matchedZ10Codes = new Set();
+  // Track which ICICI account numbers have already been credited so a single
+  // bank account shared across sub-accounts (Main / PMS / AIF) isn't summed
+  // multiple times in the dashboard total.
+  const creditedAccounts = new Set();
+  let duplicateAccountCount = 0;
 
   safeMaster.forEach((mRow, index) => {
     const clientCode = str(mRow['WS Client Code']);
@@ -296,8 +387,33 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, masterMeta = {}) 
     const excelRow = index + 2;
     const rmName = str(mRow['RM Name']);
     const iciciAccount = normalizeAccount(mRow['ICICI Acc. No.']);
-    const iciciBalance = caMapping[iciciAccount] || 0;
+    const iciciStripped = iciciAccount.replace(/^0+/, '') || '0';
+    const rawBalance = caMapping[iciciAccount] ?? caMapping[iciciStripped] ?? 0;
+
+    // Only credit the balance to the FIRST master row that uses this account.
+    const accountKey = iciciAccount + '|' + iciciStripped;
+    const isDuplicateAccount =
+      iciciAccount && rawBalance > 0 && creditedAccounts.has(accountKey);
+    const iciciBalance = isDuplicateAccount ? 0 : rawBalance;
+    if (iciciAccount && rawBalance > 0) creditedAccounts.add(accountKey);
+
     const liquidMf = liquidMfBalances[clientCode] || 0;
+    if (clientCode in liquidMfBalances) matchedZ10Codes.add(clientCode);
+
+    if (isDuplicateAccount) {
+      duplicateAccountCount += 1;
+      exceptions.push({
+        'Issue': 'Duplicate ICICI Account (balance shown on first master row only)',
+        'Master Row': excelRow,
+        'Source File': masterMeta.fileName || '',
+        'Sheet Name': masterMeta.sheetName || '',
+        'Client Code': clientCode,
+        'Client Name': str(mRow['Client Name']),
+        'RM Name': rmName,
+        'ICICI Acc. No.': iciciAccount,
+        'Liquid MF Balance': '',
+      });
+    }
 
     const baseMeta = {
       'Source File': masterMeta.fileName || '',
@@ -316,7 +432,7 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, masterMeta = {}) 
         'ICICI Acc. No.': iciciAccount,
       });
     }
-    if (!iciciAccount || !(iciciAccount in caMapping)) {
+    if (!iciciAccount || (!(iciciAccount in caMapping) && !(iciciStripped in caMapping))) {
       clientsWithoutIcici += 1;
       exceptions.push({
         'Issue': 'Missing Current Account Balance',
@@ -340,6 +456,74 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, masterMeta = {}) 
     });
   });
 
+  // Auto-add Z10 clients whose code has no Master record — they would
+  // otherwise vanish from the dashboard total. They appear as orphan rows
+  // (blank RM, blank ICICI account) and are flagged in the exception report.
+  let orphanLiquidMf = 0;
+  for (const [code, bal] of Object.entries(liquidMfBalances)) {
+    if (matchedZ10Codes.has(code)) continue;
+    orphanLiquidMf += bal;
+    const clientName = z10Names[code] || '';
+    rows.push({
+      'RM Name': '',
+      'WS Client Code': code,
+      'Client Name': clientName,
+      'ICICI Acc. No.': '',
+      'ICICI Bank Balance': 0,
+      'Liquid MF Balance': bal,
+      'Total Liquidity': bal,
+    });
+    finalMasterRows.push({
+      'WS Client Code': code,
+      'Client Name': clientName,
+      'RM Name': '',
+      'ICICI Acc. No.': '',
+      Status: 'New (from Z10)',
+    });
+    exceptions.push({
+      'Issue': 'Liquid MF Holding Without Master Record (auto-added)',
+      'Master Row': '',
+      'Source File': masterMeta.fileName || '',
+      'Sheet Name': masterMeta.sheetName || '',
+      'Client Code': code,
+      'Client Name': clientName,
+      'RM Name': '',
+      'ICICI Acc. No.': '',
+      'Liquid MF Balance': bal,
+    });
+  }
+
+  // Auto-add ICICI accounts with a balance that aren't on any Master row.
+  // Without this they'd be silently dropped, making the dashboard total
+  // diverge from the sum of the bank's Effective Balance column.
+  let orphanIciciCash = 0;
+  for (const [paddedAcct, info] of Object.entries(caAccountInfo)) {
+    const stripped = paddedAcct.replace(/^0+/, '') || '0';
+    if (creditedAccounts.has(paddedAcct + '|' + stripped)) continue;
+    if (!info.balance) continue;
+    orphanIciciCash += info.balance;
+    rows.push({
+      'RM Name': '',
+      'WS Client Code': '',
+      'Client Name': info.accountName,
+      'ICICI Acc. No.': paddedAcct,
+      'ICICI Bank Balance': info.balance,
+      'Liquid MF Balance': 0,
+      'Total Liquidity': info.balance,
+    });
+    exceptions.push({
+      'Issue': 'ICICI Balance Without Master Record (auto-added)',
+      'Master Row': '',
+      'Source File': masterMeta.fileName || '',
+      'Sheet Name': masterMeta.sheetName || '',
+      'Client Code': '',
+      'Client Name': info.accountName,
+      'RM Name': '',
+      'ICICI Acc. No.': paddedAcct,
+      'Liquid MF Balance': '',
+    });
+  }
+
   rows.sort((a, b) => {
     const rmA = a['RM Name'];
     const rmB = b['RM Name'];
@@ -355,6 +539,8 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, masterMeta = {}) 
     totalIcici: rows.reduce((s, r) => s + r['ICICI Bank Balance'], 0),
     totalLiquidMf: rows.reduce((s, r) => s + r['Liquid MF Balance'], 0),
     totalLiquidity: rows.reduce((s, r) => s + r['Total Liquidity'], 0),
+    orphanLiquidMf,
+    orphanIciciCash,
   };
 
   if (clientsWithoutRm > 0) {
@@ -363,8 +549,39 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, masterMeta = {}) 
   if (clientsWithoutIcici > 0) {
     warnings.push(`${clientsWithoutIcici} client(s) had no matching Current Account balance.`);
   }
+  if (orphanLiquidMf > 0) {
+    const formatted = orphanLiquidMf.toLocaleString('en-IN', {
+      style: 'currency', currency: 'INR', maximumFractionDigits: 0,
+    });
+    warnings.push(
+      `${formatted} of Liquid MF holdings belong to client codes not in the Master ` +
+      `(auto-added as orphan rows). See exception report.`
+    );
+  }
+  if (duplicateAccountCount > 0) {
+    warnings.push(
+      `${duplicateAccountCount} master row(s) share an ICICI account with another ` +
+      `record; balance is credited to the first row only to avoid double-counting.`
+    );
+  }
+  if (orphanIciciCash > 0) {
+    const formatted = orphanIciciCash.toLocaleString('en-IN', {
+      style: 'currency', currency: 'INR', maximumFractionDigits: 0,
+    });
+    warnings.push(
+      `${formatted} of ICICI cash sits in accounts not mapped to any Master row ` +
+      `(auto-added as orphan rows). See exception report.`
+    );
+  }
 
-  return { rows, summary, warnings, exceptions, generatedAt: new Date() };
+  return {
+    rows,
+    summary,
+    warnings,
+    exceptions,
+    finalMasterRows,
+    generatedAt: new Date(),
+  };
 }
 
 // -----------------------------------------------------------------------------
@@ -385,7 +602,9 @@ const RECON_COLS_V2 = ['CLIENT_CODE', 'CLIENTNAME', 'BANK_ACCOUNT'];
  */
 export function buildUpdatedMaster(masterRows, reconRows) {
   const safeMaster = extractArray(masterRows);
-  const safeRecon = extractArray(reconRows);
+  const safeRecon = extractArray(reconRows, [
+    'WS Balances', 'WS Balance', 'Bank Recon 150426',
+  ]);
 
   assertColumns(safeMaster, MASTER_COLS, 'Client Master');
 
@@ -597,8 +816,8 @@ export async function exportDailyTrackerZip(rows, summary) {
   return zip.generateAsync({ type: 'blob' });
 }
 
-const EXCEPTIONS_HEADER = ['Issue', 'Master Row', 'Source File', 'Sheet Name', 'Client Code', 'Client Name', 'RM Name', 'ICICI Acc. No.'];
-const EXCEPTIONS_COL_WIDTHS = [{ wch: 32 }, { wch: 12 }, { wch: 30 }, { wch: 20 }, { wch: 16 }, { wch: 36 }, { wch: 28 }, { wch: 20 }];
+const EXCEPTIONS_HEADER = ['Issue', 'Master Row', 'Source File', 'Sheet Name', 'Client Code', 'Client Name', 'RM Name', 'ICICI Acc. No.', 'Liquid MF Balance'];
+const EXCEPTIONS_COL_WIDTHS = [{ wch: 36 }, { wch: 12 }, { wch: 30 }, { wch: 20 }, { wch: 16 }, { wch: 36 }, { wch: 28 }, { wch: 20 }, { wch: 18 }];
 
 function appendReportInfoSheet(wb, generatedAt) {
   const infoSheet = XLSX.utils.json_to_sheet([

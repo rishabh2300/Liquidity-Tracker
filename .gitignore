@@ -38,3 +38,9 @@ src/assets/8K mark 01 .webp
 
 # Stray legacy file (extensionless CSS)
 /209837
+
+# Source data files used for local testing — never commit
+/*.xlsx
+/*.xlsm
+/*.xls
+/*.csv
