@@ -204,6 +204,23 @@ function buildLiquidMfBalances(z10Rows) {
   return { balances, names };
 }
 
+/**
+ * Builds a map of Axis Demat 'Ledger Bal BOD' keyed by uppercased Client Name.
+ * Axis and Wealth Spectrum use different client codes, so name is the only
+ * reliable join key. Multiple Axis rows for one client are summed.
+ */
+function buildAxisBalances(cwRows) {
+  const balances = {};
+  for (const row of cwRows) {
+    const clientName = str(getField(row, 'Client Name', 'CLIENT NAME'));
+    if (!clientName) continue;
+    const key = clientName.toUpperCase();
+    const bal = toNumber(getField(row, 'Ledger Bal BOD', 'LEDGER BAL BOD'));
+    balances[key] = (balances[key] || 0) + bal;
+  }
+  return balances;
+}
+
 function buildCurrentAccountMapping(caRows) {
   const mapping = {};
   // Per-account metadata so orphan rows can show the bank's account name.
@@ -347,10 +364,11 @@ const CA_COLS = ['Account Number', 'Available Balance'];
  * Z10 contributes Liquid MF balances (Mutual Funds + Cash only).
  * Current Account Data contributes ICICI cash balances.
  */
-export function buildDailyTracker(masterRows, z10Rows, caRows, masterMeta = {}) {
+export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMeta = {}) {
   const safeMaster = extractArray(masterRows);
   const safeZ10 = extractArray(z10Rows);
   const safeCa = extractArray(caRows, ['ICICI Balances', 'ICICI Balance']);
+  const cw = extractArray(cwRows);
 
   assertColumns(safeMaster, MASTER_COLS, 'Client Master');
   assertColumns(safeZ10, Z10_COLS, 'Z10');
@@ -365,6 +383,7 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, masterMeta = {}) 
   const exceptions = [];
   const { balances: liquidMfBalances, names: z10Names } = buildLiquidMfBalances(safeZ10);
   const { mapping: caMapping, accountInfo: caAccountInfo } = buildCurrentAccountMapping(reshapedCa);
+  const axisBalances = buildAxisBalances(cw);
 
   // Carry the master forward so any auto-added clients (Z10 orphans) flow
   // into the exported "Updated Client Master" too.
@@ -386,9 +405,13 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, masterMeta = {}) 
 
     const excelRow = index + 2;
     const rmName = str(mRow['RM Name']);
-    const iciciAccount = normalizeAccount(mRow['ICICI Acc. No.']);
+    // 'N/A' means the client intentionally has no ICICI account — skip balance
+    // lookup and suppress the "Missing Current Account Balance" exception.
+    const rawIciciField = str(mRow['ICICI Acc. No.']).toUpperCase();
+    const isNaAccount = rawIciciField === 'N/A' || rawIciciField === 'NA';
+    const iciciAccount = isNaAccount ? '' : normalizeAccount(mRow['ICICI Acc. No.']);
     const iciciStripped = iciciAccount.replace(/^0+/, '') || '0';
-    const rawBalance = caMapping[iciciAccount] ?? caMapping[iciciStripped] ?? 0;
+    const rawBalance = iciciAccount ? (caMapping[iciciAccount] ?? caMapping[iciciStripped] ?? 0) : 0;
 
     // Only credit the balance to the FIRST master row that uses this account.
     const accountKey = iciciAccount + '|' + iciciStripped;
@@ -399,6 +422,9 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, masterMeta = {}) 
 
     const liquidMf = liquidMfBalances[clientCode] || 0;
     if (clientCode in liquidMfBalances) matchedZ10Codes.add(clientCode);
+
+    const masterNameKey = str(mRow['Client Name']).toUpperCase();
+    const axisBalance = masterNameKey ? (axisBalances[masterNameKey] || 0) : 0;
 
     if (isDuplicateAccount) {
       duplicateAccountCount += 1;
@@ -432,7 +458,7 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, masterMeta = {}) 
         'ICICI Acc. No.': iciciAccount,
       });
     }
-    if (!iciciAccount || (!(iciciAccount in caMapping) && !(iciciStripped in caMapping))) {
+    if (!isNaAccount && (!iciciAccount || (!(iciciAccount in caMapping) && !(iciciStripped in caMapping)))) {
       clientsWithoutIcici += 1;
       exceptions.push({
         'Issue': 'Missing Current Account Balance',
@@ -445,14 +471,17 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, masterMeta = {}) 
       });
     }
 
+    const totalLiquidity = iciciBalance + liquidMf + axisBalance;
+
     rows.push({
       'RM Name': rmName,
       'WS Client Code': clientCode,
       'Client Name': str(mRow['Client Name']),
-      'ICICI Acc. No.': iciciAccount,
+      'ICICI Acc. No.': isNaAccount ? 'N/A' : iciciAccount,
       'ICICI Bank Balance': iciciBalance,
       'Liquid MF Balance': liquidMf,
-      'Total Liquidity': iciciBalance + liquidMf,
+      'Axis Demat Balance': axisBalance,
+      'Total Liquidity': totalLiquidity,
     });
   });
 
@@ -471,6 +500,7 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, masterMeta = {}) 
       'ICICI Acc. No.': '',
       'ICICI Bank Balance': 0,
       'Liquid MF Balance': bal,
+      'Axis Demat Balance': 0,
       'Total Liquidity': bal,
     });
     finalMasterRows.push({
@@ -509,6 +539,7 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, masterMeta = {}) 
       'ICICI Acc. No.': paddedAcct,
       'ICICI Bank Balance': info.balance,
       'Liquid MF Balance': 0,
+      'Axis Demat Balance': 0,
       'Total Liquidity': info.balance,
     });
     exceptions.push({
@@ -533,11 +564,14 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, masterMeta = {}) 
     return b['Total Liquidity'] - a['Total Liquidity'];
   });
 
+  const axisTotal = rows.reduce((s, r) => s + (r['Axis Demat Balance'] || 0), 0);
+
   const summary = {
     totalClients: rows.length,
     totalRMs: new Set(rows.map((r) => r['RM Name']).filter(Boolean)).size,
     totalIcici: rows.reduce((s, r) => s + r['ICICI Bank Balance'], 0),
     totalLiquidMf: rows.reduce((s, r) => s + r['Liquid MF Balance'], 0),
+    axisTotal,
     totalLiquidity: rows.reduce((s, r) => s + r['Total Liquidity'], 0),
     orphanLiquidMf,
     orphanIciciCash,
@@ -734,12 +768,13 @@ const DAILY_HEADER = [
   'ICICI Acc. No.',
   'ICICI Bank Balance',
   'Liquid MF Balance',
+  'Axis Demat Balance',
   'Total Liquidity',
 ];
 
 const DAILY_COL_WIDTHS = [
   { wch: 24 }, { wch: 16 }, { wch: 36 }, { wch: 18 },
-  { wch: 18 }, { wch: 18 }, { wch: 18 },
+  { wch: 18 }, { wch: 18 }, { wch: 20 }, { wch: 18 },
 ];
 
 const MASTER_HEADER = ['WS Client Code', 'Client Name', 'RM Name', 'ICICI Acc. No.'];
@@ -765,6 +800,7 @@ function dailySummaryRows(summary) {
     { Metric: 'Total RMs', Value: summary.totalRMs },
     { Metric: 'Total ICICI Balance', Value: summary.totalIcici },
     { Metric: 'Total Liquid MF Balance', Value: summary.totalLiquidMf },
+    { Metric: 'Total Axis Balance', Value: summary.axisTotal },
     { Metric: 'Total Liquidity', Value: summary.totalLiquidity },
     { Metric: 'Generated At', Value: new Date().toLocaleString('en-IN') },
   ];
@@ -773,12 +809,14 @@ function dailySummaryRows(summary) {
 function rmSummaryRows(rmName, rmRows) {
   const totalIcici = rmRows.reduce((s, r) => s + r['ICICI Bank Balance'], 0);
   const totalLiquidMf = rmRows.reduce((s, r) => s + r['Liquid MF Balance'], 0);
+  const totalAxis = rmRows.reduce((s, r) => s + (r['Axis Demat Balance'] || 0), 0);
   return [
     { Metric: 'RM Name', Value: rmName },
     { Metric: 'Clients', Value: rmRows.length },
     { Metric: 'Total ICICI Balance', Value: totalIcici },
     { Metric: 'Total Liquid MF Balance', Value: totalLiquidMf },
-    { Metric: 'Total Liquidity', Value: totalIcici + totalLiquidMf },
+    { Metric: 'Total Axis Balance', Value: totalAxis },
+    { Metric: 'Total Liquidity', Value: totalIcici + totalLiquidMf + totalAxis },
     { Metric: 'Generated At', Value: new Date().toLocaleString('en-IN') },
   ];
 }

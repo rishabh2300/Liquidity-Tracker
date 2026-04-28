@@ -512,6 +512,56 @@ h1, h2, h3, h4, h5, h6 {
   border-color: var(--border-focus);
 }
 
+.fix-input {
+  width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  outline: none;
+  background: var(--bg-panel);
+  font-family: inherit;
+}
+
+.fix-input:focus {
+  border-color: var(--border-focus);
+}
+
+.fix-account-cell {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.fix-account-cell .fix-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.btn-na {
+  flex-shrink: 0;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel);
+  color: var(--text-muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn-na:hover {
+  border-color: var(--border-focus);
+  color: var(--text-primary);
+}
+
+.btn-na-active {
+  background: var(--accent-warm, #b8963e);
+  border-color: var(--accent-warm, #b8963e);
+  color: #fff;
+}
+
 .filter-meta {
   margin-left: auto;
   font-size: 13px;
@@ -545,6 +595,28 @@ h1, h2, h3, h4, h5, h6 {
   white-space: nowrap;
   position: sticky;
   top: 0;
+}
+
+.tracker-table th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+.tracker-table th.sortable:hover {
+  color: var(--text-primary);
+}
+
+.tracker-table th.sort-active {
+  color: var(--text-primary);
+}
+
+.sort-icon {
+  font-size: 11px;
+  opacity: 0.5;
+}
+
+.tracker-table th.sort-active .sort-icon {
+  opacity: 1;
 }
 
 .tracker-table tr:last-child td {
