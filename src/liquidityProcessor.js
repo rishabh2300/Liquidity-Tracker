@@ -2,8 +2,8 @@
  * Liquidity Tracker — data processing pipelines.
  *
  * Two independent flows:
- *   1. Daily Tracker: Client Master + Z10 + Current Account Data -> per-RM tracker.
- *   2. Update Master: Bank Recon diffed against the existing Client Master.
+ *   1. Daily Tracker: Z0 Client Master + Z10 + Current Account Data -> per-RM tracker.
+ *   2. Update Master: Bank Recon diffed against the existing Z0 Client Master.
  *
  * All work happens in-memory.
  */
@@ -114,7 +114,8 @@ export function parseFile(file) {
 /** Normalizes a bank account number to a 12-digit zero-padded string. */
 export function normalizeAccount(value) {
   if (value === null || value === undefined || value === '') return '';
-  const asStr = String(value).trim().replace(/\.0+$/, '');
+  const asStr = String(value).trim().replace(/^'+/, '').replace(/\.0+$/, '');
+  if (isNoAccountValue(asStr)) return 'N/A';
   return asStr.padStart(12, '0');
 }
 
@@ -128,6 +129,16 @@ function toNumber(value) {
 
 function str(v) {
   return v === null || v === undefined ? '' : String(v).trim();
+}
+
+function isNoAccountValue(value) {
+  const normalized = str(value).replace(/\./g, '').toUpperCase();
+  return normalized === 'N/A' || normalized === 'NA' || normalized === 'NONE' || normalized === 'NO';
+}
+
+function normalizeWsCode(value) {
+  const code = str(value).replace(/\.0+$/, '');
+  return /^1\d{5}$/.test(code) ? code : '';
 }
 
 function assertColumns(rows, required, label) {
@@ -162,6 +173,38 @@ function getField(row, ...keys) {
   return undefined;
 }
 
+function getFirstNonEmptyField(row, ...keys) {
+  let fallback;
+  for (const key of keys) {
+    const value = getField(row, key);
+    if (fallback === undefined && value !== undefined) fallback = value;
+    if (str(value)) return value;
+  }
+  return fallback;
+}
+
+function getFirstAccountField(row, ...keys) {
+  let placeholder;
+  for (const key of keys) {
+    const value = getField(row, key);
+    if (value === undefined) continue;
+    if (isNoAccountValue(value)) {
+      if (placeholder === undefined) placeholder = value;
+      continue;
+    }
+    if (str(value)) return value;
+  }
+  return placeholder ?? '';
+}
+
+function getFirstWsCodeField(row, ...keys) {
+  for (const key of keys) {
+    const code = normalizeWsCode(getField(row, key));
+    if (code) return code;
+  }
+  return '';
+}
+
 // -----------------------------------------------------------------------------
 // Pipeline stages — Z10 and Current Account Data are shared primitives
 // -----------------------------------------------------------------------------
@@ -194,7 +237,7 @@ function buildLiquidMfBalances(z10Rows) {
 
     if (!isMutualFund || !isCashLiquid) continue;
 
-    const clientId = str(getField(row, 'WS CLIENT ID', 'WS client id'));
+    const clientId = normalizeWsCode(getField(row, 'WS CLIENT ID', 'WS client id'));
     if (!clientId) continue;
     balances[clientId] = (balances[clientId] || 0) + toNumber(getField(row, 'MKTVALUE'));
     if (!names[clientId]) {
@@ -228,7 +271,7 @@ function buildCurrentAccountMapping(caRows) {
 
   for (const row of caRows) {
     const raw = str(row['Account Number'] ?? row['ACCOUNT_NUMBER'] ?? row['Account No'] ?? '');
-    if (!raw) continue;
+    if (!raw || isNoAccountValue(raw)) continue;
 
     // Use ?? so a genuine 0 balance is stored, not skipped.
     const bal = toNumber(
@@ -244,7 +287,7 @@ function buildCurrentAccountMapping(caRows) {
     // Store under both the zero-padded form and the stripped form so lookups
     // succeed regardless of whether Excel dropped leading zeros.
     const padded   = normalizeAccount(raw);
-    const stripped = raw.replace(/^0+/, '') || '0';
+    const stripped = raw.replace(/^'+/, '').replace(/^0+/, '') || '0';
 
     if (padded   && !(padded   in mapping)) mapping[padded]   = bal;
     if (stripped && !(stripped in mapping)) mapping[stripped] = bal;
@@ -302,7 +345,65 @@ function reshapeByHeaderRow(rows, requiredHeaders) {
 // Tab 1 — Daily Tracker
 // -----------------------------------------------------------------------------
 
+const MASTER_FIELDS = {
+  clientCode: ['WS Client Code', 'CLIENTCODE', 'CLIENTID', 'ACCOUNTCODE', 'Client Code'],
+  clientName: ['Client Name', 'CLIENTNAME', 'CLIENT NAME'],
+  rmName: ['RM Name', 'RMNAME', 'RELATIONSHIP MANAGER'],
+  iciciAccount: [
+    'ICICI Acc. No.',
+    'TRADING BANK ACCOUNT',
+    'MANDATEBANKACCOUNTNO',
+    'CLIENT BANK ACCOUNT',
+    'BANK_ACCOUNT',
+    'Bank Account',
+  ],
+};
+
 const MASTER_COLS = ['WS Client Code', 'Client Name', 'RM Name', 'ICICI Acc. No.'];
+
+function assertMasterColumns(rows, label) {
+  if (!Array.isArray(rows)) {
+    throw new Error(`${label} did not parse to an array (got ${typeof rows}).`);
+  }
+  if (rows.length === 0) {
+    throw new Error(`${label} file appears to be empty.`);
+  }
+
+  const presentKeys = Object.keys(rows[0]);
+  const presentLower = new Set(presentKeys.map((k) => k.toLowerCase()));
+  const required = [
+    ['Client code', MASTER_FIELDS.clientCode],
+    ['Client name', MASTER_FIELDS.clientName],
+    ['RM name', MASTER_FIELDS.rmName],
+    ['ICICI account number', MASTER_FIELDS.iciciAccount],
+  ];
+  const missing = required
+    .filter(([, candidates]) => !candidates.some((c) => presentLower.has(c.toLowerCase())))
+    .map(([name]) => name);
+
+  if (missing.length > 0) {
+    throw new Error(
+      `${label} is missing required column(s): ${missing.join(', ')}. ` +
+        `Found: ${presentKeys.join(', ')}`
+    );
+  }
+}
+
+function normalizeMasterRows(masterRows, label = 'Z0 Client Master') {
+  const safeMaster = extractArray(masterRows);
+  assertMasterColumns(safeMaster, label);
+
+  return safeMaster.map((row) => {
+    const account = getFirstAccountField(row, ...MASTER_FIELDS.iciciAccount);
+    return {
+      'WS Client Code': getFirstWsCodeField(row, ...MASTER_FIELDS.clientCode),
+      'Client Name': str(getFirstNonEmptyField(row, ...MASTER_FIELDS.clientName)),
+      'RM Name': str(getFirstNonEmptyField(row, ...MASTER_FIELDS.rmName)),
+      'ICICI Acc. No.': isNoAccountValue(account) ? 'N/A' : str(account),
+      ...(row.Status ? { Status: row.Status } : {}),
+    };
+  });
+}
 
 /**
  * Bank recon files use different column names for account/balance and often
@@ -360,17 +461,16 @@ const Z10_COLS = ['WS CLIENT ID', 'SECURITY TYPE DESCRIPTION', 'ASTCLSNAME', 'MK
 const CA_COLS = ['Account Number', 'Available Balance'];
 
 /**
- * Builds the daily tracker using the Client Master as the source of truth.
+ * Builds the daily tracker using the Z0 Client Master as the source of truth.
  * Z10 contributes Liquid MF balances (Mutual Funds + Cash only).
  * Current Account Data contributes ICICI cash balances.
  */
 export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMeta = {}) {
-  const safeMaster = extractArray(masterRows);
+  const safeMaster = normalizeMasterRows(masterRows);
   const safeZ10 = extractArray(z10Rows);
   const safeCa = extractArray(caRows, ['ICICI Balances', 'ICICI Balance']);
   const cw = extractArray(cwRows);
 
-  assertColumns(safeMaster, MASTER_COLS, 'Client Master');
   assertColumns(safeZ10, Z10_COLS, 'Z10');
 
   // CA files from bank exports often have title rows before the real header.
@@ -386,7 +486,7 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
   const axisBalances = buildAxisBalances(cw);
 
   // Carry the master forward so any auto-added clients (Z10 orphans) flow
-  // into the exported "Updated Client Master" too.
+  // into the exported "Updated Z0 Client Master" too.
   const finalMasterRows = safeMaster.map((r) => ({ ...r }));
 
   const rows = [];
@@ -407,8 +507,8 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
     const rmName = str(mRow['RM Name']);
     // 'N/A' means the client intentionally has no ICICI account — skip balance
     // lookup and suppress the "Missing Current Account Balance" exception.
-    const rawIciciField = str(mRow['ICICI Acc. No.']).toUpperCase();
-    const isNaAccount = rawIciciField === 'N/A' || rawIciciField === 'NA';
+    const rawIciciField = str(mRow['ICICI Acc. No.']);
+    const isNaAccount = isNoAccountValue(rawIciciField);
     const iciciAccount = isNaAccount ? '' : normalizeAccount(mRow['ICICI Acc. No.']);
     const iciciStripped = iciciAccount.replace(/^0+/, '') || '0';
     const rawBalance = iciciAccount ? (caMapping[iciciAccount] ?? caMapping[iciciStripped] ?? 0) : 0;
@@ -459,9 +559,12 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
       });
     }
     if (!isNaAccount && (!iciciAccount || (!(iciciAccount in caMapping) && !(iciciStripped in caMapping)))) {
+      const issue = iciciAccount
+        ? 'Current Account Not Found In ICICI Balances'
+        : 'Missing Current Account Number';
       clientsWithoutIcici += 1;
       exceptions.push({
-        'Issue': 'Missing Current Account Balance',
+        'Issue': issue,
         'Master Row': excelRow,
         ...baseMeta,
         'Client Code': clientCode,
@@ -626,7 +729,7 @@ const RECON_COLS_V1 = ['Bank Code', 'Client Name', 'Bank Account'];
 const RECON_COLS_V2 = ['CLIENT_CODE', 'CLIENTNAME', 'BANK_ACCOUNT'];
 
 /**
- * Applies Bank Recon updates to the Client Master.
+ * Applies Bank Recon updates to the Z0 Client Master.
  *   - New Client Codes in the Recon are appended with a blank RM Name.
  *   - Existing clients whose Bank Account differs (after normalization)
  *     have their ICICI Acc. No. updated to the Recon value.
@@ -635,12 +738,10 @@ const RECON_COLS_V2 = ['CLIENT_CODE', 'CLIENTNAME', 'BANK_ACCOUNT'];
  * Returns the full updated master plus per-row status flags and a summary.
  */
 export function buildUpdatedMaster(masterRows, reconRows) {
-  const safeMaster = extractArray(masterRows);
+  const safeMaster = normalizeMasterRows(masterRows);
   const safeRecon = extractArray(reconRows, [
     'WS Balances', 'WS Balance', 'Bank Recon 150426',
   ]);
-
-  assertColumns(safeMaster, MASTER_COLS, 'Client Master');
 
   // Accept either the legacy header format (Bank Code / Client Name / Bank Account)
   // or the export format (CLIENT_CODE / CLIENTNAME / BANK_ACCOUNT).
@@ -651,7 +752,7 @@ export function buildUpdatedMaster(masterRows, reconRows) {
 
   const byCode = new Map();
   for (const m of safeMaster) {
-    const code = str(m['WS Client Code']);
+    const code = normalizeWsCode(m['WS Client Code']);
     if (!code) continue;
     byCode.set(code, {
       'WS Client Code': code,
@@ -665,7 +766,7 @@ export function buildUpdatedMaster(masterRows, reconRows) {
   // Pre-pass: count occurrences of each Bank Code to detect duplicates.
   const reconCodeCount = new Map();
   for (const r of safeRecon) {
-    const code = str(getField(r, 'Bank Code', 'CLIENT_CODE'));
+    const code = normalizeWsCode(getField(r, 'Bank Code', 'CLIENT_CODE'));
     if (!code) continue;
     reconCodeCount.set(code, (reconCodeCount.get(code) || 0) + 1);
   }
@@ -675,12 +776,13 @@ export function buildUpdatedMaster(masterRows, reconRows) {
   const mappingReport = [];
 
   for (const r of safeRecon) {
-    const code = str(getField(r, 'Bank Code', 'CLIENT_CODE'));
+    const rawCode = str(getField(r, 'Bank Code', 'CLIENT_CODE'));
+    const code = normalizeWsCode(rawCode);
     const reconAccount = normalizeAccount(getField(r, 'Bank Account', 'BANK_ACCOUNT'));
     const reconName = str(getField(r, 'Client Name', 'CLIENTNAME'));
 
     const reportRow = {
-      'Recon Client Code': code,
+      'Recon Client Code': code || rawCode,
       'Recon Client Name': reconName,
       'Recon Bank Account': reconAccount,
       'Mapping Status': '',
@@ -691,7 +793,9 @@ export function buildUpdatedMaster(masterRows, reconRows) {
     if (!code) {
       reportRow['Mapping Status'] = 'Error: Missing Client Code';
       reportRow['Action Taken'] = 'Skipped';
-      reportRow['Detailed Note'] = 'Row has no client code — cannot map to Master';
+      reportRow['Detailed Note'] = rawCode
+        ? 'Row client code is not a valid 6-digit WS code starting with 1'
+        : 'Row has no client code — cannot map to Master';
       mappingReport.push(reportRow);
       continue;
     }
@@ -777,7 +881,7 @@ const DAILY_COL_WIDTHS = [
   { wch: 18 }, { wch: 18 }, { wch: 20 }, { wch: 18 },
 ];
 
-const MASTER_HEADER = ['WS Client Code', 'Client Name', 'RM Name', 'ICICI Acc. No.'];
+const MASTER_HEADER = MASTER_COLS;
 const MASTER_COL_WIDTHS = [{ wch: 16 }, { wch: 36 }, { wch: 24 }, { wch: 20 }];
 
 function buildDailyWorkbookBuffer(rows, summaryRows) {
@@ -901,14 +1005,14 @@ export function exportMappingReportToXlsx(mappingReport, generatedAt) {
 }
 
 /**
- * Single-workbook export of the updated Client Master.
+ * Single-workbook export of the updated Z0 Client Master.
  */
 export function exportMasterToXlsx(rows) {
   const wb = XLSX.utils.book_new();
 
   const sheet = XLSX.utils.json_to_sheet(rows, { header: MASTER_HEADER });
   sheet['!cols'] = MASTER_COL_WIDTHS;
-  XLSX.utils.book_append_sheet(wb, sheet, 'Client Master');
+  XLSX.utils.book_append_sheet(wb, sheet, 'Z0 Client Master');
 
   return XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
 }

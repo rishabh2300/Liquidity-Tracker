@@ -15,8 +15,8 @@ import './App.css';
 const FILE_SLOTS = [
   {
     key: 'master',
-    label: 'Client Master',
-    hint: 'Columns: WS Client Code, Client Name, RM Name, ICICI Acc. No.',
+    label: 'Z0 Client Master',
+    hint: 'Columns: CLIENTCODE, CLIENTNAME, RMNAME, TRADING BANK ACCOUNT',
   },
   {
     key: 'recon',
@@ -251,7 +251,7 @@ export default function App() {
       type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     });
     const today = new Date().toISOString().slice(0, 10);
-    saveAs(blob, `Client_Master_${today}.xlsx`);
+    saveAs(blob, `Z0_ClientMaster_${today}.xlsx`);
   };
 
   const handleDownloadExceptions = () => {
@@ -298,6 +298,11 @@ export default function App() {
   const filteredTotal = useMemo(
     () => filteredRows.reduce((s, r) => s + r['Total Liquidity'], 0),
     [filteredRows]
+  );
+  const displayEntries = useMemo(() => buildClientDisplayEntries(filteredRows), [filteredRows]);
+  const allDisplayEntries = useMemo(
+    () => buildClientDisplayEntries(result?.rows ?? []),
+    [result]
   );
 
   return (
@@ -414,7 +419,7 @@ export default function App() {
             <section className="summary-row">
               <SummaryCard
                 label="Clients"
-                value={result.summary.totalClients.toLocaleString('en-IN')}
+                value={allDisplayEntries.length.toLocaleString('en-IN')}
               />
               <SummaryCard
                 label="Client Partners"
@@ -451,7 +456,7 @@ export default function App() {
                     {exporting ? 'Packaging ZIP…' : 'Export Liquidity ZIP (RM Wise)'}
                   </button>
                   <button className="btn btn-primary" onClick={handleExportMaster}>
-                    Export Updated Client Master
+                    Export Updated Z0 Client Master
                   </button>
                   {masterResult?.mappingReport?.length > 0 && (
                     <button
@@ -486,13 +491,14 @@ export default function App() {
                   />
                 </label>
                 <div className="filter-meta">
-                  Showing <strong>{filteredRows.length.toLocaleString('en-IN')}</strong> of{' '}
-                  {result.rows.length.toLocaleString('en-IN')} · Subtotal{' '}
+                  Showing <strong>{displayEntries.length.toLocaleString('en-IN')}</strong> of{' '}
+                  {allDisplayEntries.length.toLocaleString('en-IN')} clients from{' '}
+                  {filteredRows.length.toLocaleString('en-IN')} records · Subtotal{' '}
                   <strong>{INR.format(filteredTotal)}</strong>
                 </div>
               </div>
 
-              <DailyTrackerTable rows={filteredRows} />
+              <DailyTrackerTable entries={displayEntries} />
             </section>
 
             {fixableExceptions.length > 0 && (
@@ -513,7 +519,7 @@ export default function App() {
           <section className="panel panel-empty">
             <p className="empty-title">Ready to build</p>
             <p className="empty-body">
-              Upload the three source files above and select <em>Build tracker</em>. The app
+              Upload the four source files above and select <em>Build tracker</em>. The app
               will reconcile the master against the bank recon, then generate today&rsquo;s
               liquidity view in one step.
             </p>
@@ -596,6 +602,8 @@ function SummaryCard({ label, value, emphasis }) {
 const FIXABLE_FIELDS = {
   'Missing RM Name': { rmName: true },
   'Missing Current Account Balance': { iciciAccount: true },
+  'Missing Current Account Number': { iciciAccount: true },
+  'Current Account Not Found In ICICI Balances': { iciciAccount: true },
   'Liquid MF Holding Without Master Record (auto-added)': { rmName: true, iciciAccount: true },
   'ICICI Balance Without Master Record (auto-added)': {
     clientCode: true, clientName: true, rmName: true,
@@ -619,7 +627,7 @@ const ExceptionFixerSection = React.forwardRef(function ExceptionFixerSection(
           <p className="panel-meta" style={{ marginTop: 6 }}>
             Fill in the missing details below and click <em>Apply fixes &amp; rebuild</em>.
             The patched master is used for the new tracker run, and is also what gets
-            included in <em>Export Updated Client Master</em>.
+            included in <em>Export Updated Z0 Client Master</em>.
           </p>
         </div>
         <div className="actions">
@@ -701,7 +709,11 @@ const ExceptionFixerSection = React.forwardRef(function ExceptionFixerSection(
                       <div className="fix-account-cell">
                         <input
                           className="fix-input"
-                          value={fix.iciciAccount === 'N/A' ? '' : (fix.iciciAccount ?? '')}
+                          value={
+                            fix.iciciAccount === 'N/A'
+                              ? ''
+                              : (fix.iciciAccount ?? exc['ICICI Acc. No.'] ?? '')
+                          }
                           disabled={fix.iciciAccount === 'N/A'}
                           onChange={(e) => onChange(idx, 'iciciAccount', e.target.value)}
                           placeholder="Account…"
@@ -733,8 +745,65 @@ const NUMERIC_COLS = new Set([
   'ICICI Bank Balance', 'Liquid MF Balance', 'Axis Demat Balance', 'Total Liquidity',
 ]);
 
-function DailyTrackerTable({ rows }) {
+function clientGroupKey(row, index) {
+  const name = String(row['Client Name'] || '').trim();
+  if (!name) {
+    return `__blank__:${row['WS Client Code'] || row['ICICI Acc. No.'] || index}`;
+  }
+  return name
+    .replace(/\s+ex[-\s]?broker$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toUpperCase();
+}
+
+function preferredClientName(rows) {
+  const withoutExBroker = rows.find((row) =>
+    !/\s+ex[-\s]?broker$/i.test(String(row['Client Name'] || '').trim())
+  );
+  return (withoutExBroker || rows[0])?.['Client Name'] || '';
+}
+
+function compactValues(values) {
+  const unique = Array.from(new Set(values.map((v) => String(v || '').trim()).filter(Boolean)));
+  if (unique.length <= 1) return unique[0] || '';
+  return `${unique[0]} +${unique.length - 1}`;
+}
+
+function aggregateClientRows(rows) {
+  const first = rows[0] || {};
+  const rmNames = rows.map((row) => row['RM Name']);
+  return {
+    'RM Name': compactValues(rmNames),
+    'WS Client Code': compactValues(rows.map((row) => row['WS Client Code'])),
+    'Client Name': rows.length > 1 ? preferredClientName(rows) : first['Client Name'],
+    'ICICI Acc. No.': compactValues(rows.map((row) => row['ICICI Acc. No.'])),
+    'ICICI Bank Balance': rows.reduce((s, row) => s + (row['ICICI Bank Balance'] || 0), 0),
+    'Liquid MF Balance': rows.reduce((s, row) => s + (row['Liquid MF Balance'] || 0), 0),
+    'Axis Demat Balance': rows.reduce((s, row) => s + (row['Axis Demat Balance'] || 0), 0),
+    'Total Liquidity': rows.reduce((s, row) => s + (row['Total Liquidity'] || 0), 0),
+  };
+}
+
+function buildClientDisplayEntries(rows) {
+  const groups = new Map();
+  rows.forEach((row, index) => {
+    const key = clientGroupKey(row, index);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  });
+
+  return Array.from(groups.entries()).map(([key, groupRows]) => ({
+    key,
+    rows: groupRows,
+    row: groupRows.length > 1 ? aggregateClientRows(groupRows) : groupRows[0],
+    isGrouped: groupRows.length > 1,
+  }));
+}
+
+function DailyTrackerTable({ entries }) {
   const [sort, setSort] = useState({ col: null, dir: 'desc' });
+  const [expanded, setExpanded] = useState(() => new Set());
 
   const toggleSort = (col) => {
     setSort((prev) => ({
@@ -743,11 +812,20 @@ function DailyTrackerTable({ rows }) {
     }));
   };
 
-  const sortedRows = useMemo(() => {
-    if (!sort.col) return rows;
-    return [...rows].sort((a, b) => {
-      const av = a[sort.col];
-      const bv = b[sort.col];
+  const toggleExpanded = (key) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  const sortedEntries = useMemo(() => {
+    if (!sort.col) return entries;
+    return [...entries].sort((a, b) => {
+      const av = a.row[sort.col];
+      const bv = b.row[sort.col];
       if (NUMERIC_COLS.has(sort.col)) {
         const diff = (av || 0) - (bv || 0);
         return sort.dir === 'asc' ? diff : -diff;
@@ -755,9 +833,9 @@ function DailyTrackerTable({ rows }) {
       const cmp = String(av || '').localeCompare(String(bv || ''));
       return sort.dir === 'asc' ? cmp : -cmp;
     });
-  }, [rows, sort]);
+  }, [entries, sort]);
 
-  if (rows.length === 0) {
+  if (entries.length === 0) {
     return <div className="empty-table">No rows match the current filters.</div>;
   }
 
@@ -795,16 +873,37 @@ function DailyTrackerTable({ rows }) {
           </tr>
         </thead>
         <tbody>
-          {sortedRows.map((r, i) => {
+          {sortedEntries.flatMap((entry, i) => {
+            const r = entry.row;
             if (r['RM Name'] !== currentRm) {
               currentRm = r['RM Name'];
               bandIndex += 1;
             }
-            return (
-              <tr key={`${r['WS Client Code']}-${i}`} className={`band-${bandIndex % 2}`}>
+            const isOpen = expanded.has(entry.key);
+            const parent = (
+              <tr
+                key={`${entry.key}-parent`}
+                className={`band-${bandIndex % 2}${entry.isGrouped ? ' grouped-parent' : ''}`}
+              >
                 <td>{r['RM Name'] || <span className="muted">—</span>}</td>
                 <td className="mono">{r['WS Client Code']}</td>
-                <td>{r['Client Name']}</td>
+                <td>
+                  <div className="client-cell">
+                    {entry.isGrouped && (
+                      <button
+                        className="row-toggle"
+                        onClick={() => toggleExpanded(entry.key)}
+                        aria-label={isOpen ? 'Collapse client rows' : 'Expand client rows'}
+                      >
+                        {isOpen ? '▾' : '▸'}
+                      </button>
+                    )}
+                    <span>{r['Client Name']}</span>
+                    {entry.isGrouped && (
+                      <span className="duplicate-pill">{entry.rows.length} records</span>
+                    )}
+                  </div>
+                </td>
                 <td className="mono">
                   {r['ICICI Acc. No.'] || <span className="muted">—</span>}
                 </td>
@@ -814,6 +913,22 @@ function DailyTrackerTable({ rows }) {
                 <td className="num strong">{INR.format(r['Total Liquidity'])}</td>
               </tr>
             );
+            if (!entry.isGrouped || !isOpen) return [parent];
+            const children = entry.rows.map((child, childIndex) => (
+              <tr key={`${entry.key}-child-${childIndex}`} className="grouped-child">
+                <td>{child['RM Name'] || <span className="muted">—</span>}</td>
+                <td className="mono">{child['WS Client Code']}</td>
+                <td>{child['Client Name']}</td>
+                <td className="mono">
+                  {child['ICICI Acc. No.'] || <span className="muted">—</span>}
+                </td>
+                <td className="num">{INR.format(child['ICICI Bank Balance'])}</td>
+                <td className="num">{INR.format(child['Liquid MF Balance'])}</td>
+                <td className="num">{INR.format(child['Axis Demat Balance'] || 0)}</td>
+                <td className="num strong">{INR.format(child['Total Liquidity'])}</td>
+              </tr>
+            ));
+            return [parent, ...children];
           })}
         </tbody>
       </table>

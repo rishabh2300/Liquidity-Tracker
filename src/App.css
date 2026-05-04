@@ -631,6 +631,61 @@ h1, h2, h3, h4, h5, h6 {
   background-color: #F0F4F8; /* Subtle highlight on hover */
 }
 
+.client-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.row-toggle {
+  width: 24px;
+  height: 24px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel);
+  color: var(--accent-primary);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.row-toggle:hover {
+  border-color: var(--accent-primary);
+  background: #eef6f7;
+}
+
+.duplicate-pill {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: #eef6f7;
+  color: var(--accent-primary);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.grouped-parent td {
+  font-weight: 500;
+}
+
+.grouped-child td {
+  background: #f7fafb;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.grouped-child td:nth-child(3) {
+  padding-left: 48px;
+}
+
 .num {
   text-align: right;
   font-variant-numeric: tabular-nums;
