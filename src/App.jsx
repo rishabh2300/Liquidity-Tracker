@@ -2,10 +2,9 @@ import React, { useMemo, useRef, useState } from 'react';
 import {
   parseFile,
   buildDailyTracker,
-  buildUpdatedMaster,
+  buildDynamicMaster,
   exportDailyTrackerZip,
   exportMasterToXlsx,
-  exportMappingReportToXlsx,
   exportExceptionsToXlsx,
 } from './liquidityProcessor';
 import { saveAs } from 'file-saver';
@@ -16,21 +15,21 @@ const FILE_SLOTS = [
   {
     key: 'master',
     label: 'Z0 Client Master',
-    hint: 'Columns: CLIENTCODE, CLIENTNAME, RMNAME, TRADING BANK ACCOUNT',
-  },
-  {
-    key: 'recon',
-    label: 'Bank Recon (multi-sheet)',
-    hint: 'Sheets: "WS Balances" (for Master) + "ICICI Balances" (for Current Account)',
+    hint: 'Columns: CLIENTCODE, CLIENTNAME, RMNAME, CLIENT BANK ACCOUNT',
   },
   {
     key: 'z10',
-    label: 'Z10 Holding / AssetClass',
+    label: 'Z10 Holdings',
     hint: 'Columns: WS client id, Security Type Description, ASTCLSNAME, MKTVALUE',
   },
   {
+    key: 'ca',
+    label: 'Current Account Data (ICICI)',
+    hint: 'Columns: Account Number, Effective Balance, Available Balance',
+  },
+  {
     key: 'cw',
-    label: 'Client Wise (Axis Ledger)',
+    label: 'Client Wise (Axis Demat)',
     hint: 'Columns: Client Name, Ledger Bal BOD (joined to Master by uppercased Client Name)',
   },
 ];
@@ -42,7 +41,7 @@ const INR = new Intl.NumberFormat('en-IN', {
 });
 
 export default function App() {
-  const [files, setFiles] = useState({ master: null, recon: null, z10: null, cw: null });
+  const [files, setFiles] = useState({ master: null, z10: null, ca: null, cw: null });
   const [result, setResult] = useState(null);
   const [masterResult, setMasterResult] = useState(null);
   const [lastGeneratedAt, setLastGeneratedAt] = useState(null);
@@ -60,7 +59,7 @@ export default function App() {
   const [applyingFixes, setApplyingFixes] = useState(false);
   const fixerRef = useRef(null);
 
-  const allReady = files.master && files.recon && files.z10 && files.cw;
+  const allReady = files.master && files.z10 && files.ca && files.cw;
 
   const setFile = (key, file) => {
     setFiles((prev) => ({ ...prev, [key]: file }));
@@ -76,39 +75,30 @@ export default function App() {
     setProcessing(true);
     setError('');
     try {
-      const [masterData, reconData, z10Data, cwData] = await Promise.all([
+      const [masterData, z10Data, caData, cwData] = await Promise.all([
         parseFile(files.master),
-        parseFile(files.recon),
         parseFile(files.z10),
+        parseFile(files.ca),
         parseFile(files.cw),
       ]);
 
       const firstSheetRows = (data) =>
         Array.isArray(data) ? data : data[Object.keys(data)[0]] || [];
 
-      const masterRows = firstSheetRows(masterData);
+      const z0Rows = firstSheetRows(masterData);
       const z10Rows = firstSheetRows(z10Data);
+      const caRows = firstSheetRows(caData);
       const cwRows = firstSheetRows(cwData);
-
-      const reconRows = Array.isArray(reconData)
-        ? reconData
-        : reconData['WS Balances'] ||
-          reconData['WS Balance'] ||
-          reconData['Bank Recon 150426'] ||
-          [];
-      const caRows = Array.isArray(reconData)
-        ? []
-        : reconData['ICICI Balances'] || reconData['ICICI Balance'] || [];
 
       const masterSheetName = Array.isArray(masterData)
         ? null
         : Object.keys(masterData)[0] || null;
 
-      const updatedMasterResult = buildUpdatedMaster(masterRows, reconRows);
+      const masterResult = buildDynamicMaster(z0Rows);
 
       const masterMeta = { fileName: files.master.name, sheetName: masterSheetName };
       const dailyTrackerResult = buildDailyTracker(
-        updatedMasterResult.rows,
+        masterResult.rows,
         z10Rows,
         caRows,
         cwRows,
@@ -116,7 +106,7 @@ export default function App() {
       );
 
       setLastGeneratedAt((prev) => result?.generatedAt ?? prev);
-      setMasterResult(updatedMasterResult);
+      setMasterResult(masterResult);
       setResult(dailyTrackerResult);
       setParsedSources({ z10Rows, caRows, cwRows, masterMeta });
       setExceptionFixes({});
@@ -132,7 +122,7 @@ export default function App() {
   };
 
   const handleReset = () => {
-    setFiles({ master: null, recon: null, z10: null, cw: null });
+    setFiles({ master: null, z10: null, ca: null, cw: null });
     setResult(null);
     setMasterResult(null);
     setParsedSources(null);
@@ -233,6 +223,9 @@ export default function App() {
       const blob = await exportDailyTrackerZip(result.rows, result.summary);
       const today = new Date().toISOString().slice(0, 10);
       saveAs(blob, `Onza_Liquidity_Tracker_${today}.zip`);
+      setTimeout(() => {
+        alert('✅ Download Complete! Your Liquidity Tracker ZIP has been saved to your downloads folder.');
+      }, 500);
     } catch (err) {
       setError(err.message || String(err));
     } finally {
@@ -252,6 +245,9 @@ export default function App() {
     });
     const today = new Date().toISOString().slice(0, 10);
     saveAs(blob, `Z0_ClientMaster_${today}.xlsx`);
+    setTimeout(() => {
+      alert('✅ Download Complete! Your updated Z0 Client Master has been saved to your downloads folder.');
+    }, 500);
   };
 
   const handleDownloadExceptions = () => {
@@ -261,19 +257,9 @@ export default function App() {
       type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     });
     saveAs(blob, 'Daily_Exceptions.xlsx');
-  };
-
-  const handleDownloadMappingReport = () => {
-    if (!masterResult?.mappingReport?.length) return;
-    const buffer = exportMappingReportToXlsx(
-      masterResult.mappingReport,
-      masterResult.generatedAt
-    );
-    const blob = new Blob([buffer], {
-      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    });
-    const today = new Date().toISOString().slice(0, 10);
-    saveAs(blob, `Mapping_Report_${today}.xlsx`);
+    setTimeout(() => {
+      alert('✅ Download Complete! Your Exception Report has been saved to your downloads folder.');
+    }, 500);
   };
 
   const rmOptions = useMemo(() => {
@@ -314,7 +300,7 @@ export default function App() {
             <div>
               <h1 className="app-title">Liquidity Tracker</h1>
               <p className="app-subtitle">
-                One-click pipeline: reconcile master, then build daily tracker
+                One-click pipeline: build daily liquidity tracker from Z0 master and bank data
               </p>
             </div>
           </div>
@@ -393,7 +379,7 @@ export default function App() {
             >
               <div>
                 <strong>⚠ Exceptions Found:</strong> {result.exceptions.length} records have
-                missing mapping data (e.g., missing RM Name or Bank Balance).
+                missing mapping data (e.g., missing RM Name or Bank Account Number).
               </div>
               <div className="actions">
                 {fixableExceptions.length > 0 && (
@@ -458,14 +444,6 @@ export default function App() {
                   <button className="btn btn-primary" onClick={handleExportMaster}>
                     Export Updated Z0 Client Master
                   </button>
-                  {masterResult?.mappingReport?.length > 0 && (
-                    <button
-                      className="btn btn-secondary"
-                      onClick={handleDownloadMappingReport}
-                    >
-                      Download Mapping Report
-                    </button>
-                  )}
                 </div>
               </div>
 
@@ -520,8 +498,8 @@ export default function App() {
             <p className="empty-title">Ready to build</p>
             <p className="empty-body">
               Upload the four source files above and select <em>Build tracker</em>. The app
-              will reconcile the master against the bank recon, then generate today&rsquo;s
-              liquidity view in one step.
+              builds the Client Master dynamically from the Z0 file and generates
+              today&rsquo;s liquidity view in one step.
             </p>
           </section>
         )}

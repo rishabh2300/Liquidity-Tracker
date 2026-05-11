@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   normalizeAccount,
   buildDailyTracker,
-  buildUpdatedMaster,
+  buildDynamicMaster,
 } from './liquidityProcessor';
 
 describe('normalizeAccount()', () => {
@@ -151,77 +151,72 @@ describe('buildDailyTracker()', () => {
   });
 });
 
-describe('buildUpdatedMaster()', () => {
-  const masterRows = [
-    { 'WS Client Code': '100001', 'Client Name': 'Alice Corp', 'RM Name': 'Smith, John', 'ICICI Acc. No.': '1111' },
-    { 'WS Client Code': '100002', 'Client Name': 'Bob LLC',    'RM Name': 'Doe, Jane',   'ICICI Acc. No.': '2222' },
-  ];
-
-  it('appends new client codes from the Recon with a blank RM', () => {
-    const recon = [
-      { 'Bank Code': '100003', 'Client Name': 'Charlie Inc', 'Bank Account': '3333' },
-    ];
-    const { rows, summary } = buildUpdatedMaster(masterRows, recon);
-
-    const charlie = rows.find((r) => r['WS Client Code'] === '100003');
-    expect(charlie).toBeDefined();
-    expect(charlie['RM Name']).toBe('');
-    expect(charlie['ICICI Acc. No.']).toBe('000000003333');
-    expect(charlie.Status).toBe('New');
-    expect(summary.added).toBe(1);
-    expect(summary.updated).toBe(0);
-  });
-
-  it('updates records from a Z0 Client Master source', () => {
-    const z0MasterRows = [
+describe('buildDynamicMaster()', () => {
+  it('maps Z0 rows to the canonical master structure', () => {
+    const z0 = [
       {
         CLIENTCODE: '100001',
         CLIENTNAME: 'Alice Corp',
         RMNAME: 'Smith, John',
-        'TRADING BANK ACCOUNT': '1111',
+        'CLIENT BANK ACCOUNT': '000000001111',
       },
     ];
-    const recon = [
-      { CLIENT_CODE: '100001', CLIENTNAME: 'Alice Corp', BANK_ACCOUNT: '9999' },
-    ];
+    const { rows } = buildDynamicMaster(z0);
+    expect(rows).toEqual([
+      {
+        'WS Client Code': '100001',
+        'Client Name': 'Alice Corp',
+        'RM Name': 'Smith, John',
+        'ICICI Acc. No.': '1111',
+      },
+    ]);
+  });
 
-    const { rows, summary } = buildUpdatedMaster(z0MasterRows, recon);
+  it('strips leading zeros from bank accounts', () => {
+    const { rows } = buildDynamicMaster([
+      { CLIENTCODE: '100001', 'CLIENT BANK ACCOUNT': '00000123456' },
+    ]);
+    expect(rows[0]['ICICI Acc. No.']).toBe('123456');
+  });
 
+  it('falls back to NONE when the bank account is missing or all zeros', () => {
+    const { rows } = buildDynamicMaster([
+      { CLIENTCODE: '100001', 'CLIENT BANK ACCOUNT': '' },
+      { CLIENTCODE: '100002', 'CLIENT BANK ACCOUNT': '0000' },
+    ]);
+    expect(rows[0]['ICICI Acc. No.']).toBe('NONE');
+    expect(rows[1]['ICICI Acc. No.']).toBe('NONE');
+  });
+
+  it('skips rows without a client code', () => {
+    const { rows } = buildDynamicMaster([
+      { CLIENTCODE: '', CLIENTNAME: 'No Code', 'CLIENT BANK ACCOUNT': '123' },
+      { CLIENTCODE: '100001', CLIENTNAME: 'Alice', 'CLIENT BANK ACCOUNT': '123' },
+    ]);
     expect(rows).toHaveLength(1);
     expect(rows[0]['WS Client Code']).toBe('100001');
-    expect(rows[0]['Client Name']).toBe('Alice Corp');
+  });
+
+  it('uses placeholder values when name or RM are missing', () => {
+    const { rows } = buildDynamicMaster([
+      { CLIENTCODE: '100001', 'CLIENT BANK ACCOUNT': '123' },
+    ]);
+    expect(rows[0]['Client Name']).toBe('Unknown');
+    expect(rows[0]['RM Name']).toBe('Unassigned');
+  });
+
+  it('accepts spaced header variants', () => {
+    const { rows } = buildDynamicMaster([
+      {
+        'CLIENT CODE': '100001',
+        'CLIENT NAME': 'Alice',
+        'RM NAME': 'Smith, John',
+        'BANK ACCOUNT': '0123',
+      },
+    ]);
+    expect(rows[0]['WS Client Code']).toBe('100001');
+    expect(rows[0]['Client Name']).toBe('Alice');
     expect(rows[0]['RM Name']).toBe('Smith, John');
-    expect(rows[0]['ICICI Acc. No.']).toBe('000000009999');
-    expect(rows[0].Status).toBe('Updated');
-    expect(summary.updated).toBe(1);
-  });
-
-  it('updates the ICICI Acc. No. when the Recon bank account differs', () => {
-    const recon = [
-      { 'Bank Code': '100001', 'Client Name': 'Alice Corp', 'Bank Account': '9999' },
-    ];
-    const { rows, summary } = buildUpdatedMaster(masterRows, recon);
-
-    const alice = rows.find((r) => r['WS Client Code'] === '100001');
-    expect(alice['ICICI Acc. No.']).toBe('000000009999');
-    expect(alice.Status).toBe('Updated');
-    expect(summary.updated).toBe(1);
-    expect(summary.added).toBe(0);
-  });
-
-  it('leaves records unchanged when the Recon bank account matches', () => {
-    const recon = [
-      { 'Bank Code': '100001', 'Client Name': 'Alice Corp', 'Bank Account': '000000001111' },
-    ];
-    const { rows, summary } = buildUpdatedMaster(masterRows, recon);
-    const alice = rows.find((r) => r['WS Client Code'] === '100001');
-    expect(alice.Status).toBe('Unchanged');
-    expect(summary.updated).toBe(0);
-    expect(summary.unchanged).toBe(2);
-  });
-
-  it('throws on a Bank Recon missing required columns', () => {
-    expect(() => buildUpdatedMaster(masterRows, [{ Foo: 1 }]))
-      .toThrow(/Bank Recon is missing required column\(s\):/);
+    expect(rows[0]['ICICI Acc. No.']).toBe('123');
   });
 });

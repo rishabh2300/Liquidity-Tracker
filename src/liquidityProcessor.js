@@ -1,9 +1,9 @@
 /**
- * Liquidity Tracker — data processing pipelines.
+ * Liquidity Tracker — data processing pipeline.
  *
- * Two independent flows:
- *   1. Daily Tracker: Z0 Client Master + Z10 + Current Account Data -> per-RM tracker.
- *   2. Update Master: Bank Recon diffed against the existing Z0 Client Master.
+ * Daily Tracker: Z0 Client Master + Z10 + Current Account Data + Axis Client Wise
+ *                -> per-RM tracker. The Client Master mapping is built dynamically
+ *                from the Z0 file (no Bank Recon diff).
  *
  * All work happens in-memory.
  */
@@ -406,7 +406,7 @@ function normalizeMasterRows(masterRows, label = 'Z0 Client Master') {
 }
 
 /**
- * Bank recon files use different column names for account/balance and often
+ * Bank exports use different column names for account/balance and often
  * have stray leading/trailing whitespace in the headers (e.g.
  * " Effective Balance "). This remaps every recognised variant to canonical
  * keys so the rest of the pipeline can use exact-match lookups.
@@ -722,143 +722,33 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
 }
 
 // -----------------------------------------------------------------------------
-// Tab 2 — Update Master (diff against Bank Recon)
+// Dynamic Master — built directly from Z0 rows
 // -----------------------------------------------------------------------------
 
-const RECON_COLS_V1 = ['Bank Code', 'Client Name', 'Bank Account'];
-const RECON_COLS_V2 = ['CLIENT_CODE', 'CLIENTNAME', 'BANK_ACCOUNT'];
-
 /**
- * Applies Bank Recon updates to the Z0 Client Master.
- *   - New Client Codes in the Recon are appended with a blank RM Name.
- *   - Existing clients whose Bank Account differs (after normalization)
- *     have their ICICI Acc. No. updated to the Recon value.
- *   - Existing clients with matching accounts are left unchanged.
- *
- * Returns the full updated master plus per-row status flags and a summary.
+ * Builds the Client Master from Z0 rows alone. Bank account leading zeros are
+ * stripped so the account matches the Current Account Data file exactly.
  */
-export function buildUpdatedMaster(masterRows, reconRows) {
-  const safeMaster = normalizeMasterRows(masterRows);
-  const safeRecon = extractArray(reconRows, [
-    'WS Balances', 'WS Balance', 'Bank Recon 150426',
-  ]);
+export function buildDynamicMaster(z0Rows) {
+  const z0 = extractArray(z0Rows);
+  const dynamicMaster = [];
 
-  // Accept either the legacy header format (Bank Code / Client Name / Bank Account)
-  // or the export format (CLIENT_CODE / CLIENTNAME / BANK_ACCOUNT).
-  const presentKeys = safeRecon.length > 0 ? Object.keys(safeRecon[0]) : [];
-  const presentLower = new Set(presentKeys.map((k) => k.toLowerCase()));
-  const usesV2Headers = presentLower.has('client_code');
-  assertColumns(safeRecon, usesV2Headers ? RECON_COLS_V2 : RECON_COLS_V1, 'Bank Recon');
+  z0.forEach((r) => {
+    const code = String(r['CLIENTCODE'] || r['CLIENT CODE'] || '').trim();
+    if (!code) return;
 
-  const byCode = new Map();
-  for (const m of safeMaster) {
-    const code = normalizeWsCode(m['WS Client Code']);
-    if (!code) continue;
-    byCode.set(code, {
+    const rawBank = String(r['CLIENT BANK ACCOUNT'] || r['BANK ACCOUNT'] || '').trim();
+    const cleanBank = rawBank.replace(/^0+/, '');
+
+    dynamicMaster.push({
       'WS Client Code': code,
-      'Client Name': str(m['Client Name']),
-      'RM Name': str(m['RM Name']),
-      'ICICI Acc. No.': normalizeAccount(m['ICICI Acc. No.']),
-      Status: 'Unchanged',
+      'Client Name': r['CLIENTNAME'] || r['CLIENT NAME'] || 'Unknown',
+      'RM Name': r['RMNAME'] || r['RM NAME'] || 'Unassigned',
+      'ICICI Acc. No.': cleanBank || 'NONE',
     });
-  }
+  });
 
-  // Pre-pass: count occurrences of each Bank Code to detect duplicates.
-  const reconCodeCount = new Map();
-  for (const r of safeRecon) {
-    const code = normalizeWsCode(getField(r, 'Bank Code', 'CLIENT_CODE'));
-    if (!code) continue;
-    reconCodeCount.set(code, (reconCodeCount.get(code) || 0) + 1);
-  }
-
-  let added = 0;
-  let updated = 0;
-  const mappingReport = [];
-
-  for (const r of safeRecon) {
-    const rawCode = str(getField(r, 'Bank Code', 'CLIENT_CODE'));
-    const code = normalizeWsCode(rawCode);
-    const reconAccount = normalizeAccount(getField(r, 'Bank Account', 'BANK_ACCOUNT'));
-    const reconName = str(getField(r, 'Client Name', 'CLIENTNAME'));
-
-    const reportRow = {
-      'Recon Client Code': code || rawCode,
-      'Recon Client Name': reconName,
-      'Recon Bank Account': reconAccount,
-      'Mapping Status': '',
-      'Action Taken': '',
-      'Detailed Note': '',
-    };
-
-    if (!code) {
-      reportRow['Mapping Status'] = 'Error: Missing Client Code';
-      reportRow['Action Taken'] = 'Skipped';
-      reportRow['Detailed Note'] = rawCode
-        ? 'Row client code is not a valid 6-digit WS code starting with 1'
-        : 'Row has no client code — cannot map to Master';
-      mappingReport.push(reportRow);
-      continue;
-    }
-
-    const count = reconCodeCount.get(code);
-    if (count > 1) {
-      reportRow['Mapping Status'] = 'Error: Duplicate Client Code';
-      reportRow['Action Taken'] = 'Skipped — Duplicate';
-      reportRow['Detailed Note'] = `Client Code appears ${count} times in the Recon file; manual review required`;
-      mappingReport.push(reportRow);
-      continue;
-    }
-
-    if (!byCode.has(code)) {
-      byCode.set(code, {
-        'WS Client Code': code,
-        'Client Name': reconName,
-        'RM Name': '',
-        'ICICI Acc. No.': reconAccount,
-        Status: 'New',
-      });
-      added += 1;
-      reportRow['Mapping Status'] = 'Unmapped';
-      reportRow['Action Taken'] = 'Added to Master as New';
-      reportRow['Detailed Note'] = 'Client Code not found in existing Master; added with blank RM Name';
-      mappingReport.push(reportRow);
-      continue;
-    }
-
-    const existing = byCode.get(code);
-    if (reconAccount && existing['ICICI Acc. No.'] !== reconAccount) {
-      const oldAccount = existing['ICICI Acc. No.'] || '(blank)';
-      existing['ICICI Acc. No.'] = reconAccount;
-      existing.Status = 'Updated';
-      updated += 1;
-      reportRow['Mapping Status'] = 'Mapped';
-      reportRow['Action Taken'] = 'Updated Existing Master Account';
-      reportRow['Detailed Note'] = `Account changed from ${oldAccount} to ${reconAccount}`;
-    } else {
-      reportRow['Mapping Status'] = 'Mapped';
-      reportRow['Action Taken'] = 'No Change (Already up-to-date)';
-      reportRow['Detailed Note'] = reconAccount
-        ? 'Recon account matches existing Master — no update needed'
-        : 'No account number in Recon row; existing Master value kept';
-    }
-    mappingReport.push(reportRow);
-  }
-
-  const rows = Array.from(byCode.values()).sort((a, b) =>
-    a['WS Client Code'].localeCompare(b['WS Client Code'])
-  );
-
-  return {
-    rows,
-    mappingReport,
-    generatedAt: new Date(),
-    summary: {
-      totalRecords: rows.length,
-      added,
-      updated,
-      unchanged: rows.length - added - updated,
-    },
-  };
+  return { rows: dynamicMaster };
 }
 
 // -----------------------------------------------------------------------------
@@ -979,33 +869,8 @@ export function exportExceptionsToXlsx(exceptions, generatedAt) {
   return XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
 }
 
-const MAPPING_REPORT_HEADER = [
-  'Recon Client Code',
-  'Recon Client Name',
-  'Recon Bank Account',
-  'Mapping Status',
-  'Action Taken',
-  'Detailed Note',
-];
-
-const MAPPING_REPORT_COL_WIDTHS = [
-  { wch: 20 }, { wch: 36 }, { wch: 20 }, { wch: 30 }, { wch: 36 }, { wch: 60 },
-];
-
 /**
- * Single-workbook export of the detailed mapping report.
- */
-export function exportMappingReportToXlsx(mappingReport, generatedAt) {
-  const wb = XLSX.utils.book_new();
-  const sheet = XLSX.utils.json_to_sheet(mappingReport, { header: MAPPING_REPORT_HEADER });
-  sheet['!cols'] = MAPPING_REPORT_COL_WIDTHS;
-  XLSX.utils.book_append_sheet(wb, sheet, 'Mapping Report');
-  appendReportInfoSheet(wb, generatedAt);
-  return XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
-}
-
-/**
- * Single-workbook export of the updated Z0 Client Master.
+ * Single-workbook export of the Z0 Client Master.
  */
 export function exportMasterToXlsx(rows) {
   const wb = XLSX.utils.book_new();
