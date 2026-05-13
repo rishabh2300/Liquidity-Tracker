@@ -722,28 +722,29 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
 }
 
 // -----------------------------------------------------------------------------
-// Dynamic Master — built directly from Z0 rows
+// Dynamic Master — built from WS Balances rows
 // -----------------------------------------------------------------------------
 
 /**
- * Builds the Client Master from Z0 rows alone. Bank account leading zeros are
- * stripped so the account matches the Current Account Data file exactly.
+ * Builds the Client Master from WS Balances rows (Bank Recon export).
+ * Bank account leading zeros are stripped so the account matches the
+ * Current Account Data file exactly.
  */
-export function buildDynamicMaster(z0Rows) {
-  const z0 = extractArray(z0Rows);
+export function buildDynamicMaster(wsBalancesRows) {
+  const ws = extractArray(wsBalancesRows);
   const dynamicMaster = [];
 
-  z0.forEach((r) => {
-    const code = String(r['CLIENTCODE'] || r['CLIENT CODE'] || '').trim();
+  ws.forEach((r) => {
+    const code = String(r['CLIENT_CODE'] || '').trim();
     if (!code) return;
 
-    const rawBank = String(r['CLIENT BANK ACCOUNT'] || r['BANK ACCOUNT'] || '').trim();
+    const rawBank = String(r['BANK_ACCOUNT'] || '').trim();
     const cleanBank = rawBank.replace(/^0+/, '');
 
     dynamicMaster.push({
       'WS Client Code': code,
-      'Client Name': r['CLIENTNAME'] || r['CLIENT NAME'] || 'Unknown',
-      'RM Name': r['RMNAME'] || r['RM NAME'] || 'Unassigned',
+      'Client Name': r['CLIENTNAME'] || 'Unknown',
+      'RM Name': 'Unassigned',
       'ICICI Acc. No.': cleanBank || 'NONE',
     });
   });

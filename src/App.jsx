@@ -14,8 +14,8 @@ import './App.css';
 const FILE_SLOTS = [
   {
     key: 'master',
-    label: 'Z0 Client Master',
-    hint: 'Columns: CLIENTCODE, CLIENTNAME, RMNAME, CLIENT BANK ACCOUNT',
+    label: 'WS Balances (from Bank Recon)',
+    hint: 'Columns: CLIENT_CODE, CLIENTNAME, BANK_ACCOUNT',
   },
   {
     key: 'z10',
@@ -85,7 +85,7 @@ export default function App() {
       const firstSheetRows = (data) =>
         Array.isArray(data) ? data : data[Object.keys(data)[0]] || [];
 
-      const z0Rows = firstSheetRows(masterData);
+      const wsBalancesRows = firstSheetRows(masterData);
       const z10Rows = firstSheetRows(z10Data);
       const caRows = firstSheetRows(caData);
       const cwRows = firstSheetRows(cwData);
@@ -94,7 +94,7 @@ export default function App() {
         ? null
         : Object.keys(masterData)[0] || null;
 
-      const masterResult = buildDynamicMaster(z0Rows);
+      const masterResult = buildDynamicMaster(wsBalancesRows);
 
       const masterMeta = { fileName: files.master.name, sheetName: masterSheetName };
       const dailyTrackerResult = buildDailyTracker(

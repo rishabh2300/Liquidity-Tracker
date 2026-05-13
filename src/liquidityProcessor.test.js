@@ -152,21 +152,20 @@ describe('buildDailyTracker()', () => {
 });
 
 describe('buildDynamicMaster()', () => {
-  it('maps Z0 rows to the canonical master structure', () => {
-    const z0 = [
+  it('maps WS Balances rows to the canonical master structure', () => {
+    const ws = [
       {
-        CLIENTCODE: '100001',
+        CLIENT_CODE: '100001',
         CLIENTNAME: 'Alice Corp',
-        RMNAME: 'Smith, John',
-        'CLIENT BANK ACCOUNT': '000000001111',
+        BANK_ACCOUNT: '000000001111',
       },
     ];
-    const { rows } = buildDynamicMaster(z0);
+    const { rows } = buildDynamicMaster(ws);
     expect(rows).toEqual([
       {
         'WS Client Code': '100001',
         'Client Name': 'Alice Corp',
-        'RM Name': 'Smith, John',
+        'RM Name': 'Unassigned',
         'ICICI Acc. No.': '1111',
       },
     ]);
@@ -174,15 +173,15 @@ describe('buildDynamicMaster()', () => {
 
   it('strips leading zeros from bank accounts', () => {
     const { rows } = buildDynamicMaster([
-      { CLIENTCODE: '100001', 'CLIENT BANK ACCOUNT': '00000123456' },
+      { CLIENT_CODE: '100001', BANK_ACCOUNT: '00000123456' },
     ]);
     expect(rows[0]['ICICI Acc. No.']).toBe('123456');
   });
 
   it('falls back to NONE when the bank account is missing or all zeros', () => {
     const { rows } = buildDynamicMaster([
-      { CLIENTCODE: '100001', 'CLIENT BANK ACCOUNT': '' },
-      { CLIENTCODE: '100002', 'CLIENT BANK ACCOUNT': '0000' },
+      { CLIENT_CODE: '100001', BANK_ACCOUNT: '' },
+      { CLIENT_CODE: '100002', BANK_ACCOUNT: '0000' },
     ]);
     expect(rows[0]['ICICI Acc. No.']).toBe('NONE');
     expect(rows[1]['ICICI Acc. No.']).toBe('NONE');
@@ -190,33 +189,18 @@ describe('buildDynamicMaster()', () => {
 
   it('skips rows without a client code', () => {
     const { rows } = buildDynamicMaster([
-      { CLIENTCODE: '', CLIENTNAME: 'No Code', 'CLIENT BANK ACCOUNT': '123' },
-      { CLIENTCODE: '100001', CLIENTNAME: 'Alice', 'CLIENT BANK ACCOUNT': '123' },
+      { CLIENT_CODE: '', CLIENTNAME: 'No Code', BANK_ACCOUNT: '123' },
+      { CLIENT_CODE: '100001', CLIENTNAME: 'Alice', BANK_ACCOUNT: '123' },
     ]);
     expect(rows).toHaveLength(1);
     expect(rows[0]['WS Client Code']).toBe('100001');
   });
 
-  it('uses placeholder values when name or RM are missing', () => {
+  it('uses placeholder values when name is missing', () => {
     const { rows } = buildDynamicMaster([
-      { CLIENTCODE: '100001', 'CLIENT BANK ACCOUNT': '123' },
+      { CLIENT_CODE: '100001', BANK_ACCOUNT: '123' },
     ]);
     expect(rows[0]['Client Name']).toBe('Unknown');
     expect(rows[0]['RM Name']).toBe('Unassigned');
-  });
-
-  it('accepts spaced header variants', () => {
-    const { rows } = buildDynamicMaster([
-      {
-        'CLIENT CODE': '100001',
-        'CLIENT NAME': 'Alice',
-        'RM NAME': 'Smith, John',
-        'BANK ACCOUNT': '0123',
-      },
-    ]);
-    expect(rows[0]['WS Client Code']).toBe('100001');
-    expect(rows[0]['Client Name']).toBe('Alice');
-    expect(rows[0]['RM Name']).toBe('Smith, John');
-    expect(rows[0]['ICICI Acc. No.']).toBe('123');
   });
 });
