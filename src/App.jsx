@@ -13,23 +13,18 @@ import './App.css';
 
 const FILE_SLOTS = [
   {
-    key: 'master',
-    label: 'WS Balances (from Bank Recon)',
-    hint: 'Columns: CLIENT_CODE, CLIENTNAME, BANK_ACCOUNT',
+    key: 'recon',
+    label: 'Bank Recon (.xlsx)',
+    hint: 'Sheets: "WS Balances" (Client Master) + "ICICI Balances" (Current Account)',
   },
   {
     key: 'z10',
-    label: 'Z10 Holdings',
+    label: 'Z10 Holdings (.xls)',
     hint: 'Columns: WS client id, Security Type Description, ASTCLSNAME, MKTVALUE',
   },
   {
-    key: 'ca',
-    label: 'Current Account Data (ICICI)',
-    hint: 'Columns: Account Number, Effective Balance, Available Balance',
-  },
-  {
     key: 'cw',
-    label: 'Client Wise (Axis Demat)',
+    label: 'Client Wise (Axis Demat .xlsx)',
     hint: 'Columns: Client Name, Ledger Bal BOD (joined to Master by uppercased Client Name)',
   },
 ];
@@ -41,7 +36,7 @@ const INR = new Intl.NumberFormat('en-IN', {
 });
 
 export default function App() {
-  const [files, setFiles] = useState({ master: null, z10: null, ca: null, cw: null });
+  const [files, setFiles] = useState({ recon: null, z10: null, cw: null });
   const [result, setResult] = useState(null);
   const [masterResult, setMasterResult] = useState(null);
   const [lastGeneratedAt, setLastGeneratedAt] = useState(null);
@@ -59,7 +54,7 @@ export default function App() {
   const [applyingFixes, setApplyingFixes] = useState(false);
   const fixerRef = useRef(null);
 
-  const allReady = files.master && files.z10 && files.ca && files.cw;
+  const allReady = files.recon && files.z10 && files.cw;
 
   const setFile = (key, file) => {
     setFiles((prev) => ({ ...prev, [key]: file }));
@@ -75,28 +70,36 @@ export default function App() {
     setProcessing(true);
     setError('');
     try {
-      const [masterData, z10Data, caData, cwData] = await Promise.all([
-        parseFile(files.master),
+      const [reconData, z10Data, cwData] = await Promise.all([
+        parseFile(files.recon),
         parseFile(files.z10),
-        parseFile(files.ca),
         parseFile(files.cw),
       ]);
 
       const firstSheetRows = (data) =>
         Array.isArray(data) ? data : data[Object.keys(data)[0]] || [];
 
-      const wsBalancesRows = firstSheetRows(masterData);
-      const z10Rows = firstSheetRows(z10Data);
-      const caRows = firstSheetRows(caData);
-      const cwRows = firstSheetRows(cwData);
+      // Bank Recon must be a multi-sheet workbook with WS Balances + ICICI Balances.
+      if (Array.isArray(reconData)) {
+        throw new Error(
+          'Bank Recon must be an .xlsx workbook with "WS Balances" and "ICICI Balances" sheets.'
+        );
+      }
+      const wsBalancesRows = reconData['WS Balances'] || reconData['WS Balance'] || [];
+      const caRows = reconData['ICICI Balances'] || reconData['ICICI Balance'] || [];
+      if (wsBalancesRows.length === 0) {
+        throw new Error('Bank Recon is missing the "WS Balances" sheet.');
+      }
+      if (caRows.length === 0) {
+        throw new Error('Bank Recon is missing the "ICICI Balances" sheet.');
+      }
 
-      const masterSheetName = Array.isArray(masterData)
-        ? null
-        : Object.keys(masterData)[0] || null;
+      const z10Rows = firstSheetRows(z10Data);
+      const cwRows = firstSheetRows(cwData);
 
       const masterResult = buildDynamicMaster(wsBalancesRows);
 
-      const masterMeta = { fileName: files.master.name, sheetName: masterSheetName };
+      const masterMeta = { fileName: files.recon.name, sheetName: 'WS Balances' };
       const dailyTrackerResult = buildDailyTracker(
         masterResult.rows,
         z10Rows,
@@ -122,7 +125,7 @@ export default function App() {
   };
 
   const handleReset = () => {
-    setFiles({ master: null, z10: null, ca: null, cw: null });
+    setFiles({ recon: null, z10: null, cw: null });
     setResult(null);
     setMasterResult(null);
     setParsedSources(null);
@@ -327,7 +330,7 @@ export default function App() {
             <h2 className="panel-title">Upload source files</h2>
           </div>
 
-          <div className="file-grid file-grid-4">
+          <div className="file-grid">
             {FILE_SLOTS.map((slot) => (
               <FileSlot
                 key={slot.key}
@@ -497,9 +500,9 @@ export default function App() {
           <section className="panel panel-empty">
             <p className="empty-title">Ready to build</p>
             <p className="empty-body">
-              Upload the four source files above and select <em>Build tracker</em>. The app
-              builds the Client Master dynamically from the Z0 file and generates
-              today&rsquo;s liquidity view in one step.
+              Upload the three source files above and select <em>Build tracker</em>. The app
+              builds the Client Master from the Bank Recon&rsquo;s WS Balances sheet and pulls
+              cash balances from its ICICI Balances sheet in one step.
             </p>
           </section>
         )}
