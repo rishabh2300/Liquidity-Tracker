@@ -730,10 +730,26 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
  * Bank account leading zeros are stripped so the account matches the
  * Current Account Data file exactly.
  */
-export function buildDynamicMaster(wsBalancesRows) {
+export function buildDynamicMaster(wsBalancesRows, z10Rows) {
   const ws = extractArray(wsBalancesRows);
-  const dynamicMaster = [];
+  const z10 = extractArray(z10Rows);
 
+  // 1. Build a lookup dictionary for RM Names from Z10
+  const rmLookup = {};
+  z10.forEach((row) => {
+    // Clean the code just in case Z10 reads it as a float (e.g., "100001.0")
+    const code = String(row['WS ACCOUNT CODE'] || row['WS CLIENT ID'] || '')
+      .replace('.0', '')
+      .trim();
+    const rmName = String(row['RMNAME'] || row['RM NAME'] || '').trim();
+
+    if (code && rmName && !rmLookup[code]) {
+      rmLookup[code] = rmName;
+    }
+  });
+
+  // 2. Build the master, pulling the RM name from the lookup
+  const dynamicMaster = [];
   ws.forEach((r) => {
     const code = String(r['CLIENT_CODE'] || '').trim();
     if (!code) return;
@@ -744,7 +760,7 @@ export function buildDynamicMaster(wsBalancesRows) {
     dynamicMaster.push({
       'WS Client Code': code,
       'Client Name': r['CLIENTNAME'] || 'Unknown',
-      'RM Name': 'Unassigned',
+      'RM Name': rmLookup[code] || 'Unassigned',
       'ICICI Acc. No.': cleanBank || 'NONE',
     });
   });

@@ -97,7 +97,7 @@ export default function App() {
       const z10Rows = firstSheetRows(z10Data);
       const cwRows = firstSheetRows(cwData);
 
-      const masterResult = buildDynamicMaster(wsBalancesRows);
+      const masterResult = buildDynamicMaster(wsBalancesRows, z10Rows);
 
       const masterMeta = { fileName: files.recon.name, sheetName: 'WS Balances' };
       const dailyTrackerResult = buildDailyTracker(
