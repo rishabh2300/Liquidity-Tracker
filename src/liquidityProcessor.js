@@ -254,14 +254,20 @@ function buildLiquidMfBalances(z10Rows) {
  */
 function buildAxisBalances(cwRows) {
   const balances = {};
+  // Preserve the source-cased name for orphan-row display when the Axis
+  // client has no matching WS Balances record.
+  const names = {};
+  const codes = {};
   for (const row of cwRows) {
     const clientName = str(getField(row, 'Client Name', 'CLIENT NAME'));
     if (!clientName) continue;
     const key = clientName.toUpperCase();
     const bal = toNumber(getField(row, 'Ledger Bal BOD', 'LEDGER BAL BOD'));
     balances[key] = (balances[key] || 0) + bal;
+    if (!names[key]) names[key] = clientName;
+    if (!codes[key]) codes[key] = str(getField(row, 'Client Code', 'CLIENT CODE'));
   }
-  return balances;
+  return { balances, names, codes };
 }
 
 function buildCurrentAccountMapping(caRows) {
@@ -483,7 +489,7 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
   const exceptions = [];
   const { balances: liquidMfBalances, names: z10Names } = buildLiquidMfBalances(safeZ10);
   const { mapping: caMapping, accountInfo: caAccountInfo } = buildCurrentAccountMapping(reshapedCa);
-  const axisBalances = buildAxisBalances(cw);
+  const { balances: axisBalances, names: axisNames, codes: axisCodes } = buildAxisBalances(cw);
 
   // Carry the master forward so any auto-added clients (Z10 orphans) flow
   // into the exported "Updated Z0 Client Master" too.
@@ -498,6 +504,9 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
   // multiple times in the dashboard total.
   const creditedAccounts = new Set();
   let duplicateAccountCount = 0;
+  // Same idea for Axis: WS Balances often has multiple rows per client
+  // (PMS / AIF sub-accounts) but Axis reports one balance per client name.
+  const creditedAxisNames = new Set();
 
   safeMaster.forEach((mRow, index) => {
     const clientCode = str(mRow['WS Client Code']);
@@ -524,7 +533,9 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
     if (clientCode in liquidMfBalances) matchedZ10Codes.add(clientCode);
 
     const masterNameKey = str(mRow['Client Name']).toUpperCase();
-    const axisBalance = masterNameKey ? (axisBalances[masterNameKey] || 0) : 0;
+    const rawAxisBalance = masterNameKey ? (axisBalances[masterNameKey] || 0) : 0;
+    const axisBalance = creditedAxisNames.has(masterNameKey) ? 0 : rawAxisBalance;
+    if (masterNameKey && rawAxisBalance) creditedAxisNames.add(masterNameKey);
 
     if (isDuplicateAccount) {
       duplicateAccountCount += 1;
@@ -658,6 +669,39 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
     });
   }
 
+  // Auto-add Axis clients whose uppercased name didn't match any Master row.
+  // Without this they'd be missing from the per-client table even though they
+  // contribute to the dashboard's Total Axis Balance.
+  let orphanAxisCash = 0;
+  for (const [nameKey, bal] of Object.entries(axisBalances)) {
+    if (creditedAxisNames.has(nameKey)) continue;
+    if (!bal) continue;
+    orphanAxisCash += bal;
+    const displayName = axisNames[nameKey] || nameKey;
+    const axisCode = axisCodes[nameKey] || '';
+    rows.push({
+      'RM Name': '',
+      'WS Client Code': '',
+      'Client Name': displayName,
+      'ICICI Acc. No.': '',
+      'ICICI Bank Balance': 0,
+      'Liquid MF Balance': 0,
+      'Axis Demat Balance': bal,
+      'Total Liquidity': bal,
+    });
+    exceptions.push({
+      'Issue': 'Axis Demat Balance Without Master Record (auto-added)',
+      'Master Row': '',
+      'Source File': masterMeta.fileName || '',
+      'Sheet Name': masterMeta.sheetName || '',
+      'Client Code': axisCode,
+      'Client Name': displayName,
+      'RM Name': '',
+      'ICICI Acc. No.': '',
+      'Liquid MF Balance': '',
+    });
+  }
+
   rows.sort((a, b) => {
     const rmA = a['RM Name'];
     const rmB = b['RM Name'];
@@ -667,6 +711,8 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
     return b['Total Liquidity'] - a['Total Liquidity'];
   });
 
+  // Now that unmatched Axis clients are auto-added as orphan rows, summing
+  // the per-row column equals SUM(E2:E) of the Client Wise file.
   const axisTotal = rows.reduce((s, r) => s + (r['Axis Demat Balance'] || 0), 0);
 
   const summary = {
@@ -678,6 +724,7 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
     totalLiquidity: rows.reduce((s, r) => s + r['Total Liquidity'], 0),
     orphanLiquidMf,
     orphanIciciCash,
+    orphanAxisCash,
   };
 
   if (clientsWithoutRm > 0) {
@@ -708,6 +755,15 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
     warnings.push(
       `${formatted} of ICICI cash sits in accounts not mapped to any Master row ` +
       `(auto-added as orphan rows). See exception report.`
+    );
+  }
+  if (Math.abs(orphanAxisCash) > 0.5) {
+    const formatted = orphanAxisCash.toLocaleString('en-IN', {
+      style: 'currency', currency: 'INR', maximumFractionDigits: 0,
+    });
+    warnings.push(
+      `${formatted} of Axis Demat balance is from client names that don't match any ` +
+      `Master record (auto-added as orphan rows). See exception report.`
     );
   }
 
