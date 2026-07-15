@@ -6,6 +6,7 @@ import {
   exportDailyTrackerZip,
   exportMasterToXlsx,
   exportExceptionsToXlsx,
+  normalizeAccount,
 } from './liquidityProcessor';
 import { saveAs } from 'file-saver';
 import logo from './assets/gold_logo.png';
@@ -216,6 +217,103 @@ export default function App() {
       setError(err.message || String(err));
     } finally {
       setApplyingFixes(false);
+    }
+  };
+
+  // Reads a corrected Exception Report (.xlsx) and pre-fills the fixer table
+  // from it, so exceptions can be fixed in Excel instead of typed in one by one.
+  const handleUploadFixedExcel = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // allow re-selecting the same file later
+    if (!file || !result?.exceptions?.length) return;
+    setError('');
+    try {
+      const data = await parseFile(file);
+      const uploadedRows = Array.isArray(data)
+        ? data
+        : data['Exceptions'] || data[Object.keys(data)[0]] || [];
+      if (uploadedRows.length === 0) {
+        throw new Error(
+          `No rows found in "${file.name}". Upload the corrected Exception Report (.xlsx).`
+        );
+      }
+
+      const str = (v) => String(v ?? '').trim();
+      // Uploaded rows indexed by client code, normalized ICICI account, and
+      // uppercased client name. Account/name cover rows with no client code
+      // (e.g. auto-added ICICI balances, where the code is what's being fixed).
+      const byCode = new Map();
+      const byAccount = new Map();
+      const byName = new Map();
+      for (const row of uploadedRows) {
+        const code = str(row['Client Code']);
+        const acct = normalizeAccount(row['ICICI Acc. No.']);
+        const nameKey = str(row['Client Name']).toUpperCase();
+        if (code && !byCode.has(code)) byCode.set(code, row);
+        if (acct && acct !== 'N/A' && !byAccount.has(acct)) byAccount.set(acct, row);
+        if (nameKey && !byName.has(nameKey)) byName.set(nameKey, row);
+      }
+
+      let matched = 0;
+      const loadedFixes = {};
+      result.exceptions.forEach((exc, idx) => {
+        const allow = FIXABLE_FIELDS[exc['Issue']];
+        if (!allow) return;
+        const excCode = str(exc['Client Code']);
+        const excAcct = normalizeAccount(exc['ICICI Acc. No.']);
+        const excName = str(exc['Client Name']).toUpperCase();
+        const row =
+          (excCode && byCode.get(excCode)) ||
+          (excAcct && excAcct !== 'N/A' && byAccount.get(excAcct)) ||
+          (excName && byName.get(excName)) ||
+          null;
+        if (!row) return;
+        matched += 1;
+
+        // Only pick up fields this issue allows, and only where the uploaded
+        // value actually differs from what the exception already had.
+        const fix = {};
+        if (allow.clientCode && str(row['Client Code']) && str(row['Client Code']) !== excCode) {
+          fix.clientCode = str(row['Client Code']);
+        }
+        if (allow.clientName && str(row['Client Name']) && str(row['Client Name']) !== str(exc['Client Name'])) {
+          fix.clientName = str(row['Client Name']);
+        }
+        if (allow.rmName && str(row['RM Name']) && str(row['RM Name']) !== str(exc['RM Name'])) {
+          fix.rmName = str(row['RM Name']);
+        }
+        const rowAcct = normalizeAccount(row['ICICI Acc. No.']);
+        if (allow.iciciAccount && rowAcct && rowAcct !== excAcct) {
+          fix.iciciAccount = rowAcct;
+        }
+        if (Object.keys(fix).length > 0) loadedFixes[idx] = fix;
+      });
+
+      if (matched === 0) {
+        throw new Error(
+          `No rows in "${file.name}" matched the current exceptions. ` +
+            'Make sure you uploaded the corrected Exception Report for this run.'
+        );
+      }
+
+      const fixCount = Object.keys(loadedFixes).length;
+      setExceptionFixes((prev) => {
+        const merged = { ...prev };
+        for (const [idx, fix] of Object.entries(loadedFixes)) {
+          merged[idx] = { ...merged[idx], ...fix };
+        }
+        return merged;
+      });
+      fixerRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      setTimeout(() => {
+        alert(
+          fixCount > 0
+            ? `✅ Fixes successfully loaded from Excel! ${fixCount} row${fixCount === 1 ? '' : 's'} populated — review the table, then click "Apply fixes & rebuild".`
+            : `Matched ${matched} row${matched === 1 ? '' : 's'} in "${file.name}", but no new values were found to apply.`
+        );
+      }, 300);
+    } catch (err) {
+      setError(err.message || String(err));
     }
   };
 
@@ -489,6 +587,7 @@ export default function App() {
                 fixes={exceptionFixes}
                 onChange={updateFix}
                 onApply={handleApplyFixes}
+                onUploadFixed={handleUploadFixedExcel}
                 applying={applyingFixes}
                 rmOptions={rmOptions}
               />
@@ -592,26 +691,43 @@ const FIXABLE_FIELDS = {
 };
 
 const ExceptionFixerSection = React.forwardRef(function ExceptionFixerSection(
-  { fixableExceptions, fixes, onChange, onApply, applying, rmOptions },
+  { fixableExceptions, fixes, onChange, onApply, onUploadFixed, applying, rmOptions },
   ref
 ) {
+  const uploadInputRef = useRef(null);
   const filledCount = Object.values(fixes).filter((f) =>
     Object.values(f || {}).some((v) => String(v ?? '').trim() !== '')
   ).length;
 
   return (
-    <section className="panel">
+    <section className="panel" ref={ref}>
       <div className="panel-header panel-header-split">
         <div>
           <span className="panel-label">Optional</span>
           <h2 className="panel-title">Fix exceptions and rebuild</h2>
           <p className="panel-meta" style={{ marginTop: 6 }}>
-            Fill in the missing details below and click <em>Apply fixes &amp; rebuild</em>.
-            The patched master is used for the new tracker run, and is also what gets
-            included in <em>Export Updated Z0 Client Master</em>.
+            Fill in the missing details below — or upload the corrected Exception
+            Report via <em>Upload Fixed Excel</em> — and click{' '}
+            <em>Apply fixes &amp; rebuild</em>. The patched master is used for the
+            new tracker run, and is also what gets included in{' '}
+            <em>Export Updated Z0 Client Master</em>.
           </p>
         </div>
         <div className="actions">
+          <input
+            ref={uploadInputRef}
+            type="file"
+            accept=".xlsx,.xls,.csv"
+            onChange={onUploadFixed}
+            style={{ display: 'none' }}
+          />
+          <button
+            className="btn btn-secondary"
+            onClick={() => uploadInputRef.current?.click()}
+            disabled={applying}
+          >
+            Upload Fixed Excel
+          </button>
           <button
             className="btn btn-primary"
             onClick={onApply}
