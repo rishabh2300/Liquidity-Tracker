@@ -92,6 +92,7 @@ export function parseFile(file) {
 
     Papa.parse(file, {
       header: true,
+      transformHeader: (h) => String(h ?? '').trim(),
       skipEmptyLines: true,
       complete: (results) => {
         if (results.errors && results.errors.length > 0) {
@@ -105,6 +106,159 @@ export function parseFile(file) {
       error: (err) => reject(new Error(`Failed to parse "${file.name}": ${err.message}`)),
     });
   });
+}
+
+// -----------------------------------------------------------------------------
+// Content-based workbook detection
+//
+// Real exports are messy: pivot sheets sitting ahead of the data sheet
+// (Z10 ships as [Sheet2-pivot, Sheet3-pivot, Sheet1-data]), title rows above
+// the real header, renamed tabs. Instead of trusting sheet order or sheet
+// names, every input is located by scanning all sheets for the row that
+// carries ALL of its required column headers.
+// -----------------------------------------------------------------------------
+
+/**
+ * Parses a workbook into raw per-sheet grids (arrays of arrays of formatted
+ * strings). CSVs resolve to the same shape as a single-sheet workbook so
+ * findTable's header scan handles them identically (trimming, title rows,
+ * short rows).
+ */
+export function parseWorkbookGrids(file) {
+  return new Promise((resolve, reject) => {
+    const name = (file.name || '').toLowerCase();
+    const isExcel = name.endsWith('.xlsx') || name.endsWith('.xlsm') || name.endsWith('.xls');
+
+    if (!isExcel) {
+      Papa.parse(file, {
+        header: false,
+        skipEmptyLines: true,
+        complete: (results) =>
+          resolve({ kind: 'grid', sheetNames: ['CSV'], grids: { CSV: results.data || [] } }),
+        error: (err) => reject(new Error(`Failed to parse "${file.name}": ${err.message}`)),
+      });
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const wb = XLSX.read(new Uint8Array(e.target.result), { type: 'array' });
+        const grids = {};
+        wb.SheetNames.forEach((sheetName) => {
+          grids[sheetName] = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], {
+            header: 1,
+            defval: '',
+            raw: false,
+          });
+        });
+        resolve({ kind: 'excel', sheetNames: wb.SheetNames, grids });
+      } catch (err) {
+        reject(new Error(`Failed to parse Excel file "${file.name}": ${err.message}`));
+      }
+    };
+    reader.onerror = () => reject(new Error(`Failed to read file "${file.name}"`));
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+const normHeaderCell = (v) => String(v ?? '').trim().toUpperCase();
+
+/**
+ * Finds the table matching requiredCols anywhere in a parsed workbook: scans
+ * every sheet's first rows for one whose cell values contain ALL required
+ * headers. Matching is trimmed, case-insensitive, and exact-equality only —
+ * substring matching would false-positive on pivot titles like
+ * "Sum of MKTVALUE". Returns { sheetName, headerRowIndex, rows } with rows
+ * keyed by the real (trimmed) headers, or null when no sheet qualifies.
+ */
+export function findTable(parsed, requiredCols, { maxScanRows = 40 } = {}) {
+  const wanted = requiredCols.map(normHeaderCell);
+
+  const grids = parsed?.grids || {};
+  for (const sheetName of parsed?.sheetNames || Object.keys(grids)) {
+    const grid = grids[sheetName] || [];
+    const scanLimit = Math.min(grid.length, maxScanRows);
+    for (let i = 0; i < scanLimit; i++) {
+      const cellSet = new Set((grid[i] || []).map(normHeaderCell));
+      if (!wanted.every((c) => cellSet.has(c))) continue;
+
+      const headers = (grid[i] || []).map((c) => String(c ?? '').trim());
+      const rows = [];
+      for (let r = i + 1; r < grid.length; r++) {
+        const cells = grid[r];
+        if (!cells || !cells.some((v) => String(v ?? '').trim() !== '')) continue;
+        const row = {};
+        headers.forEach((h, col) => {
+          if (!h) return;
+          let key = h;
+          let n = 1;
+          while (key in row) key = `${h}_${n++}`;
+          row[key] = cells[col] ?? '';
+        });
+        rows.push(row);
+      }
+      return { sheetName, headerRowIndex: i, rows };
+    }
+  }
+  return null;
+}
+
+// Column fingerprints that uniquely identify each source report. Verified
+// against real exports: no fingerprint matches any sheet of another report
+// (the Z10 pivots lack WS CLIENT ID/ASTCLSNAME; the recon-summary sheet's
+// lookalike headers are space-padded variants that still exact-match nothing).
+const WS_MASTER_COLS = ['CLIENT_CODE', 'CLIENTNAME', 'BANK_ACCOUNT'];
+const CA_EFFECTIVE_COLS = ['Account Number', 'Effective Balance'];
+const CW_COLS = ['Client Name', 'Ledger Bal BOD'];
+const Z2_COLS = ['CLIENTID', 'CLIENTCODE', 'CLIENTNAME', 'RMNAME', 'TRADING BANK ACCOUNT'];
+const CLHR_COLS = ['Ent Id', 'Ent Name', 'Free Valuation'];
+
+/**
+ * Identifies which daily report a parsed workbook is, by content.
+ * Roles: 'recon' (WS Balances + ICICI Balances), 'z2', 'z10', 'cw',
+ * 'clhr' (recognized but unused), 'unknown' (with a hint when possible).
+ */
+export function classifyWorkbook(parsed) {
+  const ws = findTable(parsed, WS_MASTER_COLS);
+  // CA header variants in preference order — the canonical ICICI-portal pair
+  // first, then the aliases normalizeCAColumns has always tolerated.
+  const ca =
+    findTable(parsed, CA_COLS) ||
+    findTable(parsed, CA_EFFECTIVE_COLS) ||
+    findTable(parsed, ['Account No', 'Available Balance']) ||
+    findTable(parsed, ['ACCOUNT_NUMBER', 'Available Balance']) ||
+    findTable(parsed, ['Bank Account', 'Sum of Bank Balance (Custody)']) ||
+    findTable(parsed, ['Bank Account', 'Sum of Bank Balance (System)']);
+  if (ws && ca) {
+    return {
+      role: 'recon',
+      wsRows: ws.rows,
+      caRows: ca.rows,
+      wsSheet: ws.sheetName,
+      caSheet: ca.sheetName,
+    };
+  }
+  const z2 = findTable(parsed, Z2_COLS);
+  if (z2) return { role: 'z2', z2Rows: z2.rows, sheet: z2.sheetName };
+  const z10 = findTable(parsed, Z10_COLS);
+  if (z10) return { role: 'z10', z10Rows: z10.rows, sheet: z10.sheetName };
+  const cw = findTable(parsed, CW_COLS);
+  if (cw) return { role: 'cw', cwRows: cw.rows, sheet: cw.sheetName };
+  if (findTable(parsed, CLHR_COLS)) return { role: 'clhr' };
+  if (ws) {
+    return {
+      role: 'unknown',
+      hint: 'Found WS Balances data but no ICICI account sheet — the Bank Recon workbook needs both.',
+    };
+  }
+  if (ca) {
+    return {
+      role: 'unknown',
+      hint: 'Found ICICI account balances but no WS Balances sheet — the Bank Recon workbook needs both.',
+    };
+  }
+  return { role: 'unknown' };
 }
 
 // -----------------------------------------------------------------------------
@@ -149,8 +303,8 @@ function assertColumns(rows, required, label) {
     throw new Error(`${label} file appears to be empty.`);
   }
   const presentKeys = Object.keys(rows[0]);
-  const presentLower = new Set(presentKeys.map((k) => k.toLowerCase()));
-  const missing = required.filter((c) => !presentLower.has(c.toLowerCase()));
+  const presentLower = new Set(presentKeys.map((k) => k.trim().toLowerCase()));
+  const missing = required.filter((c) => !presentLower.has(c.trim().toLowerCase()));
   if (missing.length > 0) {
     throw new Error(
       `${label} is missing required column(s): ${missing.join(', ')}. ` +
@@ -213,6 +367,8 @@ function buildLiquidMfBalances(z10Rows) {
   const balances = {};
   const names = {};
   for (const row of z10Rows) {
+    // Test-client holdings (RM "Test RM") never count toward liquidity.
+    if (isTestRm(getField(row, 'RMNAME', 'RM NAME', 'RM Name'))) continue;
     const secType = str(getField(row, 'SECURITY TYPE DESCRIPTION', 'Security Type Description')).toLowerCase();
     const astCls  = str(getField(row, 'ASTCLSNAME')).toLowerCase();
     const subCls  = str(getField(row, 'SUBCLSNAME', 'Sub Class Name')).toLowerCase();
@@ -261,7 +417,7 @@ function buildAxisBalances(cwRows) {
   for (const row of cwRows) {
     const clientName = str(getField(row, 'Client Name', 'CLIENT NAME'));
     if (!clientName) continue;
-    const key = clientName.toUpperCase();
+    const key = normalizeNameKey(clientName);
     const bal = toNumber(getField(row, 'Ledger Bal BOD', 'LEDGER BAL BOD'));
     balances[key] = (balances[key] || 0) + bal;
     if (!names[key]) names[key] = clientName;
@@ -303,6 +459,74 @@ function buildCurrentAccountMapping(caRows) {
     }
   }
   return { mapping, accountInfo };
+}
+
+// -----------------------------------------------------------------------------
+// Business rules & Z2 enrichment
+// -----------------------------------------------------------------------------
+
+/**
+ * Join key for client names: collapses whitespace runs and uppercases.
+ * Axis exports carry double internal spaces ("VELLACHI  MURUGAPPAN") that
+ * a plain toUpperCase() join misses.
+ */
+function normalizeNameKey(v) {
+  return str(v).replace(/\s+/g, ' ').toUpperCase();
+}
+
+// Standing rules confirmed by ops (July 2026):
+// - Test clients (RM "Test RM" in WS/Z10/Z2, or the dummy account below) are
+//   excluded from the tracker and its totals.
+// - Onza's own ICICI current account stays visible as a tracker row, always
+//   assigned to Nikhil S Shah.
+const TEST_RM = 'test rm';
+const TEST_DUMMY_ACCOUNTS = new Set(['123456789123']);
+export const ONZA_CORPORATE_ACCOUNT = '000205040390';
+export const ONZA_CORPORATE_RM = 'Nikhil S Shah';
+
+function isTestRm(rmName) {
+  return str(rmName).toLowerCase() === TEST_RM;
+}
+
+function isTestAccount(account) {
+  const normalized = normalizeAccount(account);
+  return normalized !== '' && normalized !== 'N/A' && TEST_DUMMY_ACCOUNTS.has(normalized);
+}
+
+/**
+ * Builds join indexes over the Z2 Client Master (optional enrichment file).
+ * CLIENTCODE is preferred but holds a PAN on Ex-Broker rows, so CLIENTID is
+ * the fallback; both pass through the /^1\d{5}$/ WS-code gate. Accepts either
+ * raw Z2 rows or an already-built enrichment (returned unchanged).
+ */
+export function buildZ2Enrichment(z2Rows) {
+  if (z2Rows && z2Rows.byCode) return z2Rows;
+  const rows = extractArray(z2Rows);
+  if (!rows.length) return null;
+
+  const byCode = new Map();
+  const byAccount = new Map();
+  const byName = new Map();
+  let count = 0;
+  for (const row of rows) {
+    const rmName = str(getField(row, 'RMNAME', 'RM Name'));
+    if (isTestRm(rmName)) continue; // never re-import test clients via Z2
+    const code = getFirstWsCodeField(row, 'CLIENTCODE', 'CLIENTID');
+    const name = str(getField(row, 'CLIENTNAME', 'Client Name'));
+    if (!code && !name) continue;
+    const rawAccount = getFirstAccountField(row, 'TRADING BANK ACCOUNT', 'MANDATEBANKACCOUNTNO');
+    const account = isNoAccountValue(rawAccount) ? '' : str(rawAccount);
+    const entry = { code, name, rmName, account };
+    count += 1;
+    if (code && !byCode.has(code)) byCode.set(code, entry);
+    if (account) {
+      const padded = normalizeAccount(account);
+      if (padded && padded !== 'N/A' && !byAccount.has(padded)) byAccount.set(padded, entry);
+    }
+    const nameKey = normalizeNameKey(name);
+    if (nameKey && !byName.has(nameKey)) byName.set(nameKey, entry);
+  }
+  return { byCode, byAccount, byName, count };
 }
 
 /**
@@ -470,12 +694,15 @@ const CA_COLS = ['Account Number', 'Available Balance'];
  * Builds the daily tracker using the Z0 Client Master as the source of truth.
  * Z10 contributes Liquid MF balances (Mutual Funds + Cash only).
  * Current Account Data contributes ICICI cash balances.
+ * z2Input (optional) is the Z2 Client Master — raw rows or a prebuilt
+ * enrichment — used to auto-fill missing RM names and resolve orphans.
  */
-export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMeta = {}) {
+export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMeta = {}, z2Input = null) {
   const safeMaster = normalizeMasterRows(masterRows);
   const safeZ10 = extractArray(z10Rows);
   const safeCa = extractArray(caRows, ['ICICI Balances', 'ICICI Balance']);
   const cw = extractArray(cwRows);
+  const z2 = buildZ2Enrichment(z2Input);
 
   assertColumns(safeZ10, Z10_COLS, 'Z10');
 
@@ -487,17 +714,27 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
 
   const warnings = [];
   const exceptions = [];
+  const autoResolved = [];
   const { balances: liquidMfBalances, names: z10Names } = buildLiquidMfBalances(safeZ10);
   const { mapping: caMapping, accountInfo: caAccountInfo } = buildCurrentAccountMapping(reshapedCa);
   const { balances: axisBalances, names: axisNames, codes: axisCodes } = buildAxisBalances(cw);
 
-  // Carry the master forward so any auto-added clients (Z10 orphans) flow
-  // into the exported "Updated Z0 Client Master" too.
-  const finalMasterRows = safeMaster.map((r) => ({ ...r }));
+  // Carry the master forward so any auto-added clients (Z10/Z2 orphans) flow
+  // into the exported "Updated Z0 Client Master" too. Built inside the master
+  // loop so excluded test clients and Z2-filled RM names carry through.
+  const finalMasterRows = [];
+  const masterCodes = new Set();
+  // Balances belonging to excluded test clients must not re-enter the totals
+  // through the orphan auto-add loops below.
+  const excludedAccountKeys = new Set();
+  const excludedNameKeys = new Set();
+  const excludedCodes = new Set();
 
   const rows = [];
   let clientsWithoutRm = 0;
   let clientsWithoutIcici = 0;
+  let testClientsExcluded = 0;
+  let rmFilledFromZ2 = 0;
   const matchedZ10Codes = new Set();
   // Track which ICICI account numbers have already been credited so a single
   // bank account shared across sub-accounts (Main / PMS / AIF) isn't summed
@@ -510,29 +747,61 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
 
   safeMaster.forEach((mRow, index) => {
     const clientCode = str(mRow['WS Client Code']);
-    if (!clientCode) return;
+    if (!clientCode) {
+      // Codeless rows can't be tracked but must survive into the exported master.
+      finalMasterRows.push({ ...mRow });
+      return;
+    }
 
     const excelRow = index + 2;
-    const rmName = str(mRow['RM Name']);
+    let rmName = str(mRow['RM Name']);
+    const rawIciciField = str(mRow['ICICI Acc. No.']);
+
+    // Standing rule: test clients never reach the tracker or its totals —
+    // including via the orphan auto-add loops, hence the suppression sets.
+    if (isTestRm(rmName) || isTestAccount(rawIciciField)) {
+      testClientsExcluded += 1;
+      excludedCodes.add(clientCode);
+      excludedNameKeys.add(normalizeNameKey(mRow['Client Name']));
+      if (!isNoAccountValue(rawIciciField)) {
+        const acct = normalizeAccount(mRow['ICICI Acc. No.']);
+        if (acct) excludedAccountKeys.add(acct + '|' + (acct.replace(/^0+/, '') || '0'));
+      }
+      return;
+    }
+
+    // Fill missing/Unassigned RM names from Z2 — the two sources never
+    // disagree where both exist, so this is safe to auto-apply.
+    if ((!rmName || rmName.toLowerCase() === 'unassigned') && z2) {
+      const hit = z2.byCode.get(clientCode);
+      if (hit && hit.rmName) {
+        rmName = hit.rmName;
+        rmFilledFromZ2 += 1;
+      }
+    }
+
+    masterCodes.add(clientCode);
+    finalMasterRows.push({ ...mRow, 'RM Name': rmName });
+
     // 'N/A' means the client intentionally has no ICICI account — skip balance
     // lookup and suppress the "Missing Current Account Balance" exception.
-    const rawIciciField = str(mRow['ICICI Acc. No.']);
     const isNaAccount = isNoAccountValue(rawIciciField);
     const iciciAccount = isNaAccount ? '' : normalizeAccount(mRow['ICICI Acc. No.']);
     const iciciStripped = iciciAccount.replace(/^0+/, '') || '0';
     const rawBalance = iciciAccount ? (caMapping[iciciAccount] ?? caMapping[iciciStripped] ?? 0) : 0;
 
-    // Only credit the balance to the FIRST master row that uses this account.
+    // Only credit the balance to the FIRST master row that uses this account
+    // (non-zero either way — a shared negative must not double-count).
     const accountKey = iciciAccount + '|' + iciciStripped;
     const isDuplicateAccount =
-      iciciAccount && rawBalance > 0 && creditedAccounts.has(accountKey);
+      iciciAccount && rawBalance !== 0 && creditedAccounts.has(accountKey);
     const iciciBalance = isDuplicateAccount ? 0 : rawBalance;
-    if (iciciAccount && rawBalance > 0) creditedAccounts.add(accountKey);
+    if (iciciAccount && rawBalance !== 0) creditedAccounts.add(accountKey);
 
     const liquidMf = liquidMfBalances[clientCode] || 0;
     if (clientCode in liquidMfBalances) matchedZ10Codes.add(clientCode);
 
-    const masterNameKey = str(mRow['Client Name']).toUpperCase();
+    const masterNameKey = normalizeNameKey(mRow['Client Name']);
     const rawAxisBalance = masterNameKey ? (axisBalances[masterNameKey] || 0) : 0;
     const axisBalance = creditedAxisNames.has(masterNameKey) ? 0 : rawAxisBalance;
     if (masterNameKey && rawAxisBalance) creditedAxisNames.add(masterNameKey);
@@ -557,7 +826,9 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
       'Sheet Name': masterMeta.sheetName || '',
     };
 
-    if (!rmName) {
+    // 'Unassigned' is a placeholder, not a real RM — surface it as missing
+    // so it lands in the exception report instead of hiding in plain sight.
+    if (!rmName || rmName.toLowerCase() === 'unassigned') {
       clientsWithoutRm += 1;
       exceptions.push({
         'Issue': 'Missing RM Name',
@@ -600,15 +871,20 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
   });
 
   // Auto-add Z10 clients whose code has no Master record — they would
-  // otherwise vanish from the dashboard total. They appear as orphan rows
-  // (blank RM, blank ICICI account) and are flagged in the exception report.
+  // otherwise vanish from the dashboard total. When Z2 knows the client the
+  // row is completed from it silently; otherwise it appears as an orphan row
+  // (blank RM, blank ICICI account) flagged in the exception report.
   let orphanLiquidMf = 0;
   for (const [code, bal] of Object.entries(liquidMfBalances)) {
     if (matchedZ10Codes.has(code)) continue;
-    orphanLiquidMf += bal;
-    const clientName = z10Names[code] || '';
+    if (excludedCodes.has(code)) continue;
+    masterCodes.add(code);
+    const z2Hit = z2 ? z2.byCode.get(code) : null;
+    if (!(z2Hit && z2Hit.rmName)) orphanLiquidMf += bal;
+    const clientName = z10Names[code] || z2Hit?.name || '';
+    const rmName = z2Hit?.rmName || '';
     rows.push({
-      'RM Name': '',
+      'RM Name': rmName,
       'WS Client Code': code,
       'Client Name': clientName,
       'ICICI Acc. No.': '',
@@ -620,31 +896,113 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
     finalMasterRows.push({
       'WS Client Code': code,
       'Client Name': clientName,
-      'RM Name': '',
-      'ICICI Acc. No.': '',
-      Status: 'New (from Z10)',
+      'RM Name': rmName,
+      // NONE (not '') so an Apply-Fixes rebuild doesn't resurrect this row
+      // as a "Missing Current Account Number" exception.
+      'ICICI Acc. No.': 'NONE',
+      Status: z2Hit ? 'New (from Z10, RM via Z2)' : 'New (from Z10)',
     });
-    exceptions.push({
-      'Issue': 'Liquid MF Holding Without Master Record (auto-added)',
-      'Master Row': '',
-      'Source File': masterMeta.fileName || '',
-      'Sheet Name': masterMeta.sheetName || '',
-      'Client Code': code,
-      'Client Name': clientName,
-      'RM Name': '',
-      'ICICI Acc. No.': '',
-      'Liquid MF Balance': bal,
-    });
+    if (z2Hit && rmName) {
+      autoResolved.push({
+        'Type': 'Liquid MF holding without master record',
+        'Client Code': code,
+        'Client Name': clientName,
+        'RM Name': rmName,
+        'ICICI Acc. No.': '',
+        'Amount': bal,
+        'Resolved From': 'Z2 Client Master',
+      });
+    } else {
+      exceptions.push({
+        'Issue': 'Liquid MF Holding Without Master Record (auto-added)',
+        'Master Row': '',
+        'Source File': masterMeta.fileName || '',
+        'Sheet Name': masterMeta.sheetName || '',
+        'Client Code': code,
+        'Client Name': clientName,
+        'RM Name': '',
+        'ICICI Acc. No.': '',
+        'Liquid MF Balance': bal,
+      });
+    }
   }
 
   // Auto-add ICICI accounts with a balance that aren't on any Master row.
   // Without this they'd be silently dropped, making the dashboard total
   // diverge from the sum of the bank's Effective Balance column.
+  // Onza's own corporate account is kept as a normal row (standing rule);
+  // accounts Z2 can map to a client are completed silently.
   let orphanIciciCash = 0;
   for (const [paddedAcct, info] of Object.entries(caAccountInfo)) {
     const stripped = paddedAcct.replace(/^0+/, '') || '0';
     if (creditedAccounts.has(paddedAcct + '|' + stripped)) continue;
+    if (excludedAccountKeys.has(paddedAcct + '|' + stripped)) continue;
+    if (isTestAccount(paddedAcct)) continue;
     if (!info.balance) continue;
+
+    if (paddedAcct === ONZA_CORPORATE_ACCOUNT) {
+      rows.push({
+        'RM Name': ONZA_CORPORATE_RM,
+        'WS Client Code': '',
+        'Client Name': info.accountName || 'Onza Financial Services',
+        'ICICI Acc. No.': paddedAcct,
+        'ICICI Bank Balance': info.balance,
+        'Liquid MF Balance': 0,
+        'Axis Demat Balance': 0,
+        'Total Liquidity': info.balance,
+      });
+      autoResolved.push({
+        'Type': "Onza's own current account (standing rule)",
+        'Client Code': '',
+        'Client Name': info.accountName,
+        'RM Name': ONZA_CORPORATE_RM,
+        'ICICI Acc. No.': paddedAcct,
+        'Amount': info.balance,
+        'Resolved From': 'Standing rule',
+      });
+      continue;
+    }
+
+    const z2Hit = z2 ? z2.byAccount.get(paddedAcct) : null;
+    if (z2Hit && z2Hit.code && !masterCodes.has(z2Hit.code)) {
+      masterCodes.add(z2Hit.code);
+      // Credit the client's Axis balance here too, so the Axis-orphan loop
+      // doesn't raise a separate exception for a client Z2 fully identifies.
+      const resolvedNameKey = normalizeNameKey(z2Hit.name || info.accountName);
+      let resolvedAxis = 0;
+      if (resolvedNameKey && !creditedAxisNames.has(resolvedNameKey) && axisBalances[resolvedNameKey]) {
+        resolvedAxis = axisBalances[resolvedNameKey];
+        creditedAxisNames.add(resolvedNameKey);
+      }
+      rows.push({
+        'RM Name': z2Hit.rmName,
+        'WS Client Code': z2Hit.code,
+        'Client Name': z2Hit.name || info.accountName,
+        'ICICI Acc. No.': paddedAcct,
+        'ICICI Bank Balance': info.balance,
+        'Liquid MF Balance': 0,
+        'Axis Demat Balance': resolvedAxis,
+        'Total Liquidity': info.balance + resolvedAxis,
+      });
+      finalMasterRows.push({
+        'WS Client Code': z2Hit.code,
+        'Client Name': z2Hit.name || info.accountName,
+        'RM Name': z2Hit.rmName,
+        'ICICI Acc. No.': stripped,
+        Status: 'New (from Z2)',
+      });
+      autoResolved.push({
+        'Type': 'ICICI balance without master record',
+        'Client Code': z2Hit.code,
+        'Client Name': z2Hit.name || info.accountName,
+        'RM Name': z2Hit.rmName,
+        'ICICI Acc. No.': paddedAcct,
+        'Amount': info.balance,
+        'Resolved From': 'Z2 Client Master',
+      });
+      continue;
+    }
+
     orphanIciciCash += info.balance;
     rows.push({
       'RM Name': '',
@@ -669,16 +1027,53 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
     });
   }
 
-  // Auto-add Axis clients whose uppercased name didn't match any Master row.
+  // Auto-add Axis clients whose normalized name didn't match any Master row.
   // Without this they'd be missing from the per-client table even though they
-  // contribute to the dashboard's Total Axis Balance.
+  // contribute to the dashboard's Total Axis Balance. Names Z2 recognizes as
+  // clients not yet in the master are completed silently.
   let orphanAxisCash = 0;
   for (const [nameKey, bal] of Object.entries(axisBalances)) {
     if (creditedAxisNames.has(nameKey)) continue;
+    if (excludedNameKeys.has(nameKey)) continue;
     if (!bal) continue;
-    orphanAxisCash += bal;
     const displayName = axisNames[nameKey] || nameKey;
     const axisCode = axisCodes[nameKey] || '';
+
+    const z2Hit = z2 ? z2.byName.get(nameKey) : null;
+    if (z2Hit && z2Hit.code && !masterCodes.has(z2Hit.code)) {
+      masterCodes.add(z2Hit.code);
+      rows.push({
+        'RM Name': z2Hit.rmName,
+        'WS Client Code': z2Hit.code,
+        'Client Name': z2Hit.name || displayName,
+        'ICICI Acc. No.': '',
+        'ICICI Bank Balance': 0,
+        'Liquid MF Balance': 0,
+        'Axis Demat Balance': bal,
+        'Total Liquidity': bal,
+      });
+      finalMasterRows.push({
+        'WS Client Code': z2Hit.code,
+        'Client Name': z2Hit.name || displayName,
+        'RM Name': z2Hit.rmName,
+        // NONE (not '') so an Apply-Fixes rebuild doesn't resurrect this row
+        // as a "Missing Current Account Number" exception.
+        'ICICI Acc. No.': 'NONE',
+        Status: 'New (from Z2)',
+      });
+      autoResolved.push({
+        'Type': 'Axis Demat balance without master record',
+        'Client Code': z2Hit.code,
+        'Client Name': z2Hit.name || displayName,
+        'RM Name': z2Hit.rmName,
+        'ICICI Acc. No.': '',
+        'Amount': bal,
+        'Resolved From': 'Z2 Client Master',
+      });
+      continue;
+    }
+
+    orphanAxisCash += bal;
     rows.push({
       'RM Name': '',
       'WS Client Code': '',
@@ -727,6 +1122,22 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
     orphanAxisCash,
   };
 
+  if (testClientsExcluded > 0) {
+    warnings.push(
+      `Excluded ${testClientsExcluded} test client row(s) (RM "Test RM" / dummy account) from the tracker and totals.`
+    );
+  }
+  if (z2 && (rmFilledFromZ2 > 0 || autoResolved.length > 0)) {
+    warnings.push(
+      `Z2 Client Master: auto-filled ${rmFilledFromZ2} RM name(s) and resolved ` +
+      `${autoResolved.length} unmatched record(s) — no manual fixing needed for these.`
+    );
+  }
+  if (!z2 && (clientsWithoutRm > 0 || orphanIciciCash > 0 || orphanLiquidMf > 0 || Math.abs(orphanAxisCash) > 0.5)) {
+    warnings.push(
+      'Tip: also upload the Z2 Client Master export — it auto-fills missing RM names and unmatched accounts.'
+    );
+  }
   if (clientsWithoutRm > 0) {
     warnings.push(`${clientsWithoutRm} client(s) in the Master have no RM Name.`);
   }
@@ -772,7 +1183,9 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
     summary,
     warnings,
     exceptions,
+    autoResolved,
     finalMasterRows,
+    stats: { testClientsExcluded, rmFilledFromZ2 },
     generatedAt: new Date(),
   };
 }
@@ -790,14 +1203,13 @@ export function buildDynamicMaster(wsBalancesRows, z10Rows) {
   const ws = extractArray(wsBalancesRows);
   const z10 = extractArray(z10Rows);
 
-  // 1. Build a lookup dictionary for RM Names from Z10
+  // 1. Build a lookup dictionary for RM Names from Z10 (header casing varies
+  //    between Wealth Spectrum exports, so reads are case-insensitive).
   const rmLookup = {};
   z10.forEach((row) => {
-    // Clean the code just in case Z10 reads it as a float (e.g., "100001.0")
-    const code = String(row['WS ACCOUNT CODE'] || row['WS CLIENT ID'] || '')
-      .replace('.0', '')
-      .trim();
-    const rmName = String(row['RMNAME'] || row['RM NAME'] || '').trim();
+    // Clean the code in case Z10 reads it as a float (e.g., "100001.0")
+    const code = str(getField(row, 'WS ACCOUNT CODE', 'WS CLIENT ID')).replace(/\.0+$/, '');
+    const rmName = str(getField(row, 'RMNAME', 'RM NAME'));
 
     if (code && rmName && !rmLookup[code]) {
       rmLookup[code] = rmName;
@@ -807,17 +1219,35 @@ export function buildDynamicMaster(wsBalancesRows, z10Rows) {
   // 2. Build the master, pulling the RM name from the lookup
   const dynamicMaster = [];
   ws.forEach((r) => {
-    const code = String(r['CLIENT_CODE'] || '').trim();
+    const code = str(getField(r, 'CLIENT_CODE'));
     if (!code) return;
 
-    const rawBank = String(r['BANK_ACCOUNT'] || '').trim();
+    const rawBank = str(getField(r, 'BANK_ACCOUNT'));
+    const bankCode = str(getField(r, 'BANK_CODE', 'BANKNAME')).toUpperCase();
     const cleanBank = rawBank.replace(/^0+/, '');
+
+    // ICICI current accounts are always 12-digit. A row whose bank code names
+    // another bank (SBI, …), or whose bank code is a NONE placeholder with a
+    // non-12-digit internal ledger code (501009xx), can never match the ICICI
+    // portal export — classify it N/A instead of raising a false
+    // "not found in ICICI" exception. Blank bank codes keep legacy behavior.
+    const digits = rawBank.replace(/\D/g, '');
+    const bankCodeSaysOther =
+      bankCode !== '' && !isNoAccountValue(bankCode) && !bankCode.includes('ICICI');
+    const nonePlaceholderLedger =
+      bankCode !== '' && isNoAccountValue(bankCode) && digits.length !== 12;
+    const nonIcici = bankCodeSaysOther || nonePlaceholderLedger;
 
     dynamicMaster.push({
       'WS Client Code': code,
-      'Client Name': r['CLIENTNAME'] || 'Unknown',
+      'Client Name': getField(r, 'CLIENTNAME') || 'Unknown',
       'RM Name': rmLookup[code] || 'Unassigned',
-      'ICICI Acc. No.': cleanBank || 'NONE',
+      'ICICI Acc. No.':
+        !rawBank || isNoAccountValue(rawBank) || !cleanBank
+          ? 'NONE'
+          : nonIcici
+            ? 'N/A'
+            : cleanBank,
     });
   });
 
@@ -933,11 +1363,18 @@ function appendReportInfoSheet(wb, generatedAt) {
   XLSX.utils.book_append_sheet(wb, infoSheet, 'Report Info');
 }
 
-export function exportExceptionsToXlsx(exceptions, generatedAt) {
+export function exportExceptionsToXlsx(exceptions, generatedAt, autoResolved = []) {
   const wb = XLSX.utils.book_new();
   const sheet = XLSX.utils.json_to_sheet(exceptions, { header: EXCEPTIONS_HEADER });
   sheet['!cols'] = EXCEPTIONS_COL_WIDTHS;
   XLSX.utils.book_append_sheet(wb, sheet, 'Exceptions');
+  if (autoResolved.length > 0) {
+    const resolvedSheet = XLSX.utils.json_to_sheet(autoResolved, {
+      header: ['Type', 'Client Code', 'Client Name', 'RM Name', 'ICICI Acc. No.', 'Amount', 'Resolved From'],
+    });
+    resolvedSheet['!cols'] = [{ wch: 40 }, { wch: 14 }, { wch: 36 }, { wch: 24 }, { wch: 18 }, { wch: 16 }, { wch: 20 }];
+    XLSX.utils.book_append_sheet(wb, resolvedSheet, 'Auto-Resolved');
+  }
   appendReportInfoSheet(wb, generatedAt);
   return XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
 }

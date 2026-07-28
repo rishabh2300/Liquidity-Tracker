@@ -1,6 +1,8 @@
 import React, { useMemo, useRef, useState } from 'react';
 import {
   parseFile,
+  parseWorkbookGrids,
+  classifyWorkbook,
   buildDailyTracker,
   buildDynamicMaster,
   exportDailyTrackerZip,
@@ -12,21 +14,32 @@ import { saveAs } from 'file-saver';
 import logo from './assets/gold_logo.png';
 import './App.css';
 
-const FILE_SLOTS = [
+// Upload roles — each dropped file is identified by its CONTENTS
+// (classifyWorkbook), never by file name or sheet order.
+const ROLE_META = [
   {
     key: 'recon',
-    label: 'Bank Recon (.xlsx)',
-    hint: 'Sheets: "WS Balances" (Client Master) + "ICICI Balances" (Current Account)',
+    label: 'Bank Recon',
+    required: true,
+    hint: 'WS Balances + ICICI Balances — sheets found automatically',
   },
   {
     key: 'z10',
-    label: 'Z10 Holdings (.xls)',
-    hint: 'Columns: WS client id, Security Type Description, ASTCLSNAME, MKTVALUE',
+    label: 'Z10 Holdings',
+    required: true,
+    hint: 'Raw holdings table found automatically (pivot sheets ignored)',
   },
   {
     key: 'cw',
-    label: 'Client Wise (Axis Demat .xlsx)',
-    hint: 'Columns: Client Name, Ledger Bal BOD (joined to Master by uppercased Client Name)',
+    label: 'Client Wise (Axis)',
+    required: true,
+    hint: 'Ledger Bal BOD per Axis client',
+  },
+  {
+    key: 'z2',
+    label: 'Z2 Client Master',
+    required: false,
+    hint: 'Optional — auto-fills RM names & unmatched accounts',
   },
 ];
 
@@ -37,7 +50,11 @@ const INR = new Intl.NumberFormat('en-IN', {
 });
 
 export default function App() {
-  const [files, setFiles] = useState({ recon: null, z10: null, cw: null });
+  // Files identified by content, keyed by role: { recon, z10, cw, z2 },
+  // each entry { file, cls } where cls carries the extracted table rows.
+  const [uploads, setUploads] = useState({});
+  const [fileNotes, setFileNotes] = useState([]);
+  const [classifying, setClassifying] = useState(false);
   const [result, setResult] = useState(null);
   const [masterResult, setMasterResult] = useState(null);
   const [lastGeneratedAt, setLastGeneratedAt] = useState(null);
@@ -54,65 +71,38 @@ export default function App() {
   const [exceptionFixes, setExceptionFixes] = useState({});
   const [applyingFixes, setApplyingFixes] = useState(false);
   const fixerRef = useRef(null);
+  const dropInputRef = useRef(null);
+  // Mirror of `uploads` that async handlers can read/write without racing on
+  // stale closures (two rapid drops must both see each other's files).
+  const uploadsRef = useRef({});
 
-  const allReady = files.recon && files.z10 && files.cw;
+  const allReady = Boolean(uploads.recon && uploads.z10 && uploads.cw);
 
-  const setFile = (key, file) => {
-    setFiles((prev) => ({ ...prev, [key]: file }));
-    setResult(null);
-    setMasterResult(null);
-    setParsedSources(null);
-    setExceptionFixes({});
-    setError('');
-  };
-
-  const handleProcess = async () => {
-    if (!allReady) return;
+  const runBuild = (u) => {
+    if (!u.recon || !u.z10 || !u.cw) return;
     setProcessing(true);
     setError('');
     try {
-      const [reconData, z10Data, cwData] = await Promise.all([
-        parseFile(files.recon),
-        parseFile(files.z10),
-        parseFile(files.cw),
-      ]);
+      const { wsRows, caRows, wsSheet } = u.recon.cls;
+      const z10Rows = u.z10.cls.z10Rows;
+      const cwRows = u.cw.cls.cwRows;
+      const z2Rows = u.z2 ? u.z2.cls.z2Rows : null;
 
-      const firstSheetRows = (data) =>
-        Array.isArray(data) ? data : data[Object.keys(data)[0]] || [];
-
-      // Bank Recon must be a multi-sheet workbook with WS Balances + ICICI Balances.
-      if (Array.isArray(reconData)) {
-        throw new Error(
-          'Bank Recon must be an .xlsx workbook with "WS Balances" and "ICICI Balances" sheets.'
-        );
-      }
-      const wsBalancesRows = reconData['WS Balances'] || reconData['WS Balance'] || [];
-      const caRows = reconData['ICICI Balances'] || reconData['ICICI Balance'] || [];
-      if (wsBalancesRows.length === 0) {
-        throw new Error('Bank Recon is missing the "WS Balances" sheet.');
-      }
-      if (caRows.length === 0) {
-        throw new Error('Bank Recon is missing the "ICICI Balances" sheet.');
-      }
-
-      const z10Rows = firstSheetRows(z10Data);
-      const cwRows = firstSheetRows(cwData);
-
-      const masterResult = buildDynamicMaster(wsBalancesRows, z10Rows);
-
-      const masterMeta = { fileName: files.recon.name, sheetName: 'WS Balances' };
+      const masterResult = buildDynamicMaster(wsRows, z10Rows);
+      const masterMeta = { fileName: u.recon.file.name, sheetName: wsSheet || 'WS Balances' };
       const dailyTrackerResult = buildDailyTracker(
         masterResult.rows,
         z10Rows,
         caRows,
         cwRows,
-        masterMeta
+        masterMeta,
+        z2Rows
       );
 
       setLastGeneratedAt((prev) => result?.generatedAt ?? prev);
       setMasterResult(masterResult);
       setResult(dailyTrackerResult);
-      setParsedSources({ z10Rows, caRows, cwRows, masterMeta });
+      setParsedSources({ z10Rows, caRows, cwRows, masterMeta, z2Rows });
       setExceptionFixes({});
     } catch (err) {
       setError(err.message || String(err));
@@ -125,8 +115,82 @@ export default function App() {
     }
   };
 
+  // Parses and identifies every dropped file by content, then builds the
+  // tracker automatically once the three required reports are present.
+  const handleFilesAdded = async (fileList) => {
+    const list = Array.from(fileList || []);
+    if (!list.length) return;
+    setClassifying(true);
+    setError('');
+    const notes = [];
+    const additions = {};
+    try {
+      for (const file of list) {
+        try {
+          const parsed = await parseWorkbookGrids(file);
+          const cls = classifyWorkbook(parsed);
+          if (cls.role === 'recon' || cls.role === 'z10' || cls.role === 'cw' || cls.role === 'z2') {
+            const displaced = additions[cls.role] || uploadsRef.current[cls.role];
+            if (displaced && (displaced.file.name !== file.name || displaced.file.size !== file.size)) {
+              const label = ROLE_META.find((r) => r.key === cls.role)?.label || cls.role;
+              notes.push({
+                name: file.name,
+                level: 'warn',
+                message: `Also recognized as ${label} — it replaced "${displaced.file.name}". Remove one via the role card if that's wrong.`,
+              });
+            }
+            additions[cls.role] = { file, cls };
+          } else if (cls.role === 'clhr') {
+            notes.push({
+              name: file.name,
+              level: 'info',
+              message: 'Recognized as Client Level Holding Report — not needed for the tracker, ignored.',
+            });
+          } else {
+            notes.push({
+              name: file.name,
+              level: 'warn',
+              message:
+                cls.hint ||
+                'Not recognized. Expected: Bank Recon, Z10 Holdings, Client Wise (Axis), or Z2 Client Master.',
+            });
+          }
+        } catch (err) {
+          notes.push({ name: file.name, level: 'error', message: err.message || String(err) });
+        }
+      }
+      // Merge through the ref so concurrent drops both land, then only
+      // auto-build when this drop actually contributed something new —
+      // an unrecognized file must not wipe in-progress exception fixes.
+      uploadsRef.current = { ...uploadsRef.current, ...additions };
+      const merged = uploadsRef.current;
+      setUploads(merged);
+      setFileNotes(notes);
+      if (Object.keys(additions).length > 0 && merged.recon && merged.z10 && merged.cw) {
+        runBuild(merged);
+      }
+    } finally {
+      setClassifying(false);
+    }
+  };
+
+  const removeUpload = (key) => {
+    const next = { ...uploadsRef.current };
+    delete next[key];
+    uploadsRef.current = next;
+    setUploads(next);
+    setFileNotes([]);
+    setResult(null);
+    setMasterResult(null);
+    setParsedSources(null);
+    setExceptionFixes({});
+    setError('');
+  };
+
   const handleReset = () => {
-    setFiles({ recon: null, z10: null, cw: null });
+    uploadsRef.current = {};
+    setUploads({});
+    setFileNotes([]);
     setResult(null);
     setMasterResult(null);
     setParsedSources(null);
@@ -208,7 +272,8 @@ export default function App() {
         parsedSources.z10Rows,
         parsedSources.caRows,
         parsedSources.cwRows,
-        parsedSources.masterMeta
+        parsedSources.masterMeta,
+        parsedSources.z2Rows
       );
 
       setResult(dailyTrackerResult);
@@ -352,8 +417,8 @@ export default function App() {
   };
 
   const handleDownloadExceptions = () => {
-    if (!result?.exceptions?.length) return;
-    const buffer = exportExceptionsToXlsx(result.exceptions, result.generatedAt);
+    if (!result?.exceptions?.length && !result?.autoResolved?.length) return;
+    const buffer = exportExceptionsToXlsx(result.exceptions, result.generatedAt, result.autoResolved ?? []);
     const blob = new Blob([buffer], {
       type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     });
@@ -428,25 +493,63 @@ export default function App() {
             <h2 className="panel-title">Upload source files</h2>
           </div>
 
-          <div className="file-grid">
-            {FILE_SLOTS.map((slot) => (
-              <FileSlot
-                key={slot.key}
-                slot={slot}
-                file={files[slot.key]}
-                onSelect={(f) => setFile(slot.key, f)}
-                onClear={() => setFile(slot.key, null)}
+          <div
+            className="dropzone"
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={(e) => {
+              e.preventDefault();
+              handleFilesAdded(e.dataTransfer.files);
+            }}
+            onClick={() => dropInputRef.current?.click()}
+          >
+            <input
+              ref={dropInputRef}
+              type="file"
+              multiple
+              accept=".csv,.xlsx,.xlsm,.xls"
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                handleFilesAdded(e.target.files);
+                e.target.value = '';
+              }}
+            />
+            <p className="dropzone-title">
+              {classifying ? 'Reading files…' : 'Drop all daily files here — or click to browse'}
+            </p>
+            <p className="dropzone-hint">
+              Any file names, any order. Each file is identified by its contents, and the
+              tracker builds itself once the three required reports are in.
+            </p>
+          </div>
+
+          <div className="file-grid file-grid-4">
+            {ROLE_META.map((role) => (
+              <RoleCard
+                key={role.key}
+                role={role}
+                upload={uploads[role.key]}
+                onClear={() => removeUpload(role.key)}
               />
             ))}
           </div>
 
-          <div className="actions">
+          {fileNotes.length > 0 && (
+            <div className="alert alert-notes">
+              {fileNotes.map((n, i) => (
+                <div key={i}>
+                  <strong>{n.name}:</strong> {n.message}
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="actions" style={{ marginTop: '16px' }}>
             <button
               className="btn btn-primary"
-              onClick={handleProcess}
-              disabled={!allReady || processing}
+              onClick={() => runBuild(uploads)}
+              disabled={!allReady || processing || classifying}
             >
-              {processing ? 'Building tracker…' : 'Build tracker'}
+              {processing ? 'Building tracker…' : 'Rebuild tracker'}
             </button>
             <button
               className="btn btn-secondary"
@@ -468,9 +571,19 @@ export default function App() {
           )}
 
           {error && <div className="alert alert-error">{error}</div>}
-          {result?.exceptions?.length > 0 && (
+          {result?.warnings?.length > 0 && (
+            <div className="alert alert-info">
+              <strong>Build notes</strong>
+              <ul className="notes-list">
+                {result.warnings.map((w, i) => (
+                  <li key={i}>{w}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {(result?.exceptions?.length > 0 || result?.autoResolved?.length > 0) && (
             <div
-              className="alert alert-warn"
+              className={`alert ${result.exceptions.length > 0 ? 'alert-warn' : 'alert-info'}`}
               style={{
                 display: 'flex',
                 justifyContent: 'space-between',
@@ -479,8 +592,20 @@ export default function App() {
               }}
             >
               <div>
-                <strong>⚠ Exceptions Found:</strong> {result.exceptions.length} records have
-                missing mapping data (e.g., missing RM Name or Bank Account Number).
+                {result.exceptions.length > 0 ? (
+                  <>
+                    <strong>⚠ Exceptions Found:</strong> {result.exceptions.length} records have
+                    missing mapping data (e.g., missing RM Name or Bank Account Number).
+                    {result.autoResolved?.length > 0 && (
+                      <> Another {result.autoResolved.length} were auto-resolved — see the report.</>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <strong>✓ No exceptions.</strong> {result.autoResolved.length} unmatched
+                    record(s) were auto-resolved (Z2 / standing rules) — no action needed.
+                  </>
+                )}
               </div>
               <div className="actions">
                 {fixableExceptions.length > 0 && (
@@ -599,9 +724,10 @@ export default function App() {
           <section className="panel panel-empty">
             <p className="empty-title">Ready to build</p>
             <p className="empty-body">
-              Upload the three source files above and select <em>Build tracker</em>. The app
-              builds the Client Master from the Bank Recon&rsquo;s WS Balances sheet and pulls
-              cash balances from its ICICI Balances sheet in one step.
+              Drop the daily files above — Bank Recon, Z10 Holdings, and Client Wise
+              (plus the optional Z2 Client Master for automatic RM mapping). Each file is
+              recognized by its contents and the tracker builds itself; no naming, ordering,
+              or slot-picking needed.
             </p>
           </section>
         )}
@@ -618,53 +744,31 @@ export default function App() {
 // Sub-components
 // -----------------------------------------------------------------------------
 
-function FileSlot({ slot, file, onSelect, onClear }) {
-  const inputRef = useRef(null);
-
-  const onDrop = (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    const f = e.dataTransfer.files?.[0];
-    if (f) onSelect(f);
-  };
-
+function RoleCard({ role, upload, onClear }) {
   return (
-    <div
-      className={`file-slot ${file ? 'file-slot-filled' : ''}`}
-      onDragOver={(e) => e.preventDefault()}
-      onDrop={onDrop}
-    >
+    <div className={`file-slot ${upload ? 'file-slot-filled' : ''}`}>
       <div className="file-slot-header">
-        <span className="file-slot-label">{slot.label}</span>
-        {file && (
+        <span className="file-slot-label">
+          {role.label}
+          {!role.required && <span className="role-optional"> · optional</span>}
+        </span>
+        {upload && (
           <button className="file-slot-clear" onClick={onClear} aria-label="Remove file">
             ×
           </button>
         )}
       </div>
-      <p className="file-slot-hint">{slot.hint}</p>
+      <p className="file-slot-hint">{role.hint}</p>
 
-      {file ? (
+      {upload ? (
         <div className="file-slot-file">
-          <span className="file-name">{file.name}</span>
-          <span className="file-size">{(file.size / 1024).toFixed(1)} KB</span>
+          <span className="file-name">{upload.file.name}</span>
+          <span className="file-size">{(upload.file.size / 1024).toFixed(1)} KB</span>
         </div>
       ) : (
-        <>
-          <input
-            ref={inputRef}
-            type="file"
-            accept=".csv,.xlsx,.xlsm,.xls"
-            onChange={(e) => e.target.files?.[0] && onSelect(e.target.files[0])}
-            style={{ display: 'none' }}
-          />
-          <button
-            className="file-slot-trigger"
-            onClick={() => inputRef.current?.click()}
-          >
-            Choose file or drop here
-          </button>
-        </>
+        <p className="file-slot-waiting">
+          {role.required ? 'Waiting for file…' : 'Not uploaded'}
+        </p>
       )}
     </div>
   );
