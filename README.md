@@ -18,16 +18,27 @@ The app runs locally in the browser during development and is packaged as a Wind
 
 ## Input Files
 
-The app expects four source files:
+Drop all daily files into the single upload zone — file names, sheet names,
+and sheet order don't matter. Every file is identified by its column
+fingerprint (`classifyWorkbook`), and the tracker builds automatically once
+the three required reports are present:
 
-| Slot | Expected File | Important Columns / Sheets |
+| Report | Required | Identified by |
 | --- | --- | --- |
-| Z0 Client Master | Z0 client master export | `CLIENTCODE`, `CLIENTID`, `CLIENTNAME`, `RMNAME`, `TRADING BANK ACCOUNT`, `MANDATEBANKACCOUNTNO` |
-| Bank Recon | Multi-sheet bank recon workbook | `WS Balances`, `ICICI Balances` |
-| Z10 Holding / AssetClass | Z10 holdings export | `WS client id`, `ASTCLSNAME`, `MKTVALUE` |
-| Client Wise | Axis ledger export | `Client Name`, `Ledger Bal BOD` |
+| Bank Recon | Yes | `WS Balances` table (`CLIENT_CODE`, `CLIENTNAME`, `BANK_ACCOUNT`) + ICICI account table (`Account Number`, balance column) |
+| Z10 Holding / AssetClass | Yes | `WS CLIENT ID`, `SECURITY TYPE DESCRIPTION`, `ASTCLSNAME`, `MKTVALUE` (pivot sheets are skipped) |
+| Client Wise (Axis) | Yes | `Client Name`, `Ledger Bal BOD` |
+| Z2 Client Master | Optional | `CLIENTID`, `CLIENTCODE`, `CLIENTNAME`, `RMNAME`, `TRADING BANK ACCOUNT` |
 
-WS client codes are validated as exactly six digits starting with `1`. If a PAN appears in `CLIENTCODE`, the app falls back to the valid WS code in `CLIENTID`.
+When the Z2 Client Master is included, missing RM names and unmatched
+accounts/holdings are auto-resolved from it and listed on an "Auto-Resolved"
+sheet in the exception report.
+
+Standing rules: test clients (RM "Test RM" / dummy account) are excluded from
+the tracker and totals; Onza's own current account appears as a row under
+Nikhil S Shah. WS client codes are validated as exactly six digits starting
+with `1` — if a PAN appears in `CLIENTCODE`, the app falls back to the valid
+WS code in `CLIENTID`.
 
 ## Outputs
 
@@ -82,27 +93,39 @@ npm run tauri:build
 
 Local Tauri builds require Rust and the platform-specific Tauri build dependencies.
 
-## Windows Release Workflow
+## Releasing an Update
 
-GitHub Actions workflow: `Build Windows Release`
+Installed desktop apps check for updates on every launch against the public
+releases repo (`rishabh2300/liquidity-tracker-releases`) and offer to install
+newer versions automatically. To ship a release:
 
-The workflow runs on:
+1. Bump `version` in `src-tauri/tauri.conf.json` (e.g. `1.1.0` → `1.2.0`) and
+   commit & push.
+2. Tag and push the tag:
 
-- Pushes to `main`
-- Manual `workflow_dispatch`
+   ```bash
+   git tag app-v1.2.0 && git push origin app-v1.2.0
+   ```
 
-It builds the Windows release with `tauri-apps/tauri-action`.
+3. GitHub Actions (`Build Windows Release`) builds the signed installers and
+   uploads them with `latest.json` as a **draft** release on the public
+   releases repo.
+4. Publish the draft there — every installed PC gets the update prompt on its
+   next launch.
 
-Required release secrets:
+Required repository secrets (Settings → Secrets and variables → Actions):
 
-- `TAURI_PRIVATE_KEY`
-- `TAURI_KEY_PASSWORD`
+- `TAURI_SIGNING_PRIVATE_KEY` — contents of the updater signing key
+  (`~/.tauri/liquidity-tracker-updater.key` on the machine that generated it,
+  2026-07-28).
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` — the key's password
+  (`~/.tauri/liquidity-tracker-updater.password.txt` on the same machine).
+- `RELEASES_TOKEN` — fine-grained PAT with read/write **Contents** permission
+  on `liquidity-tracker-releases`, so CI in this (private) repo can publish
+  releases to the public one.
 
-The workflow creates a draft GitHub release named:
-
-```text
-Liquidity Tracker v__VERSION__
-```
+Losing the signing key or its password means future updates can't be signed —
+keep copies somewhere safe outside this machine.
 
 ## Tech Stack
 

@@ -1,8 +1,14 @@
 name: Build Windows Release
 
+# Runs when a release tag (app-v*) is pushed, or manually from the Actions
+# tab. Builds the signed Windows installers and uploads them — together with
+# the auto-update manifest (latest.json) — as a DRAFT release on the public
+# releases repo (liquidity-tracker-releases). Publish the draft there to roll
+# the update out to every installed PC.
 on:
   push:
-    branches: [main]
+    tags:
+      - 'app-v*'
   workflow_dispatch:
 
 jobs:
@@ -32,12 +38,21 @@ jobs:
 
       - uses: tauri-apps/tauri-action@v0
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
-          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+          # PAT with write access to the public releases repo.
+          GITHUB_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          # Updater artifact signing (keypair of 2026-07-28).
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
+          owner: rishabh2300
+          repo: liquidity-tracker-releases
+          # Required when releasing to another repo: this commit SHA doesn't
+          # exist there, so target that repo's default branch instead.
+          releaseCommitish: main
+          # We ship NSIS only; keep latest.json pointing at the .exe.
+          updaterJsonPreferNsis: true
           tagName: app-v__VERSION__
-          releaseName: "Liquidity Tracker v__VERSION__"
-          releaseBody: "See the assets to download this version and install."
+          releaseName: 'Liquidity Tracker v__VERSION__'
+          releaseBody: 'Fresh installs: download the -setup.exe. Installed apps pick this update up automatically on next launch.'
           releaseDraft: true
           prerelease: false

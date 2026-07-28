@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Onza Liquidity Tracker",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "identifier": "com.onza.liquidity-tracker",
   "build": {
     "frontendDist": "../dist",
@@ -25,7 +25,8 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": "nsis",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -35,12 +36,10 @@
   },
   "plugins": {
     "updater": {
-      "active": true,
       "endpoints": [
-        "https://github.com/rishabh2300/Liquidity-Tracker/releases/latest/download/latest.json"
+        "https://github.com/rishabh2300/liquidity-tracker-releases/releases/latest/download/latest.json"
       ],
-      "dialog": true,
-      "pubkey": ""
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVBMzVDM0M2NUYyRDE2NjEKUldSaEZpMWZ4c00xV29Gd3drV0hMNWpnMmptcVFrSXhNclJCcTRxSEVKWlpYOEVHQXhscXlWWmYK"
     }
   }
 }
