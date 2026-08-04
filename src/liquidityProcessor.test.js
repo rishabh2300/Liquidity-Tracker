@@ -5,6 +5,7 @@ import {
   buildDynamicMaster,
   findTable,
   classifyWorkbook,
+  mergeTrackerRows,
 } from './liquidityProcessor';
 
 describe('normalizeAccount()', () => {
@@ -564,3 +565,163 @@ describe('buildDailyTracker() — business rules & Z2 enrichment', () => {
     expect(summary.totalIcici).toBe(-500);
   });
 });
+
+describe('mergeTrackerRows()', () => {
+  const makeResult = () => {
+    const rows = [
+      { 'RM Name': 'Smith', 'WS Client Code': '100006', 'Client Name': 'Ramamoorthi Jagadish', 'ICICI Acc. No.': '000201113729', 'ICICI Bank Balance': 1000, 'Liquid MF Balance': 500, 'Axis Demat Balance': 0, 'Total Liquidity': 1500 },
+      { 'RM Name': '', 'WS Client Code': '', 'Client Name': 'R JAGADISH', 'ICICI Acc. No.': '', 'ICICI Bank Balance': 0, 'Liquid MF Balance': 0, 'Axis Demat Balance': 250, 'Total Liquidity': 250 },
+      { 'RM Name': 'Doe', 'WS Client Code': '100010', 'Client Name': 'Unrelated', 'ICICI Acc. No.': 'N/A', 'ICICI Bank Balance': 42, 'Liquid MF Balance': 0, 'Axis Demat Balance': 0, 'Total Liquidity': 42 },
+    ];
+    return {
+      rows,
+      summary: { totalClients: 3, totalRMs: 2, totalIcici: 1042, totalLiquidMf: 500, axisTotal: 250, totalLiquidity: 1792 },
+    };
+  };
+
+  it('keeps the first-selected identity and sums all financial columns', () => {
+    const result = makeResult();
+    const merged = mergeTrackerRows(result, [[result.rows[0]], [result.rows[1]]]);
+
+    expect(merged.rows).toHaveLength(2);
+    const primary = merged.rows[0];
+    expect(primary['Client Name']).toBe('Ramamoorthi Jagadish');
+    expect(primary['WS Client Code']).toBe('100006');
+    expect(primary['RM Name']).toBe('Smith');
+    expect(primary['ICICI Acc. No.']).toBe('000201113729');
+    expect(primary['ICICI Bank Balance']).toBe(1000);
+    expect(primary['Axis Demat Balance']).toBe(250);
+    expect(primary['Total Liquidity']).toBe(1750);
+    expect(merged.rows.some((r) => r['Client Name'] === 'R JAGADISH')).toBe(false);
+  });
+
+  it('preserves grand totals and updates the client/RM counts', () => {
+    const result = makeResult();
+    const merged = mergeTrackerRows(result, [[result.rows[1]], [result.rows[0]]]);
+
+    const total = merged.rows.reduce((s, r) => s + r['Total Liquidity'], 0);
+    expect(total).toBe(1792);
+    expect(merged.summary.totalClients).toBe(2);
+    // Selection order matters: R JAGADISH was ticked first, so its blank RM wins.
+    expect(merged.rows[0]['Client Name']).toBe('R JAGADISH');
+    expect(merged.rows[0]['RM Name']).toBe('');
+    expect(merged.summary.totalRMs).toBe(1);
+  });
+
+  it('returns the result unchanged for fewer than two rows', () => {
+    const result = makeResult();
+    expect(mergeTrackerRows(result, [[result.rows[0]]])).toBe(result);
+    expect(mergeTrackerRows(result, [])).toBe(result);
+  });
+
+  it('does not mutate the original rows', () => {
+    const result = makeResult();
+    mergeTrackerRows(result, [[result.rows[0]], [result.rows[1]]]);
+    expect(result.rows).toHaveLength(3);
+    expect(result.rows[0]['Total Liquidity']).toBe(1500);
+  });
+});
+
+describe('buildDailyTracker() — saved manual orphan merges', () => {
+  const meta = { fileName: 'recon.xlsx', sheetName: 'WS Balances' };
+  const master = [
+    { 'WS Client Code': '100006', 'Client Name': 'Ramamoorthi Jagadish', 'RM Name': 'Prashant', 'ICICI Acc. No.': '1111' },
+  ];
+  const z10 = [
+    { 'WS CLIENT ID': '100006', 'SECURITY TYPE DESCRIPTION': 'Equity', 'ASTCLSNAME': 'Stock', 'MKTVALUE': '1' },
+  ];
+  const ca = [
+    { 'Account Number': '000000001111', 'Effective Balance': '5000' },
+    { 'Account Number': '000205041622', 'Account Name': 'BIZBOOST BUSINESS SOLUTIONS LLP', 'Effective Balance': '700' },
+  ];
+  const cw = [{ 'Client Name': 'R JAGADISH', 'Ledger Bal BOD': '250' }];
+
+  it('merges an Axis-name orphan into an existing client and drops the exception', () => {
+    const merges = { axisNames: { 'R JAGADISH': '100006' }, accounts: {} };
+    const { rows, exceptions, autoResolved } = buildDailyTracker(master, z10, ca, cw, meta, null, merges);
+
+    const target = rows.find((r) => r['WS Client Code'] === '100006');
+    expect(target['Axis Demat Balance']).toBe(250);
+    expect(target['Total Liquidity']).toBe(5250);
+    expect(rows.some((r) => r['Client Name'] === 'R JAGADISH')).toBe(false);
+    expect(exceptions.filter((e) => e['Issue'].startsWith('Axis Demat'))).toHaveLength(0);
+    expect(autoResolved.some((a) => a['Resolved From'] === 'Saved manual mapping')).toBe(true);
+  });
+
+  it('merges an ICICI-account orphan into an existing client', () => {
+    const merges = { axisNames: {}, accounts: { '000205041622': '100006' } };
+    const { rows, exceptions } = buildDailyTracker(master, z10, ca, cw, meta, null, merges);
+
+    const target = rows.find((r) => r['WS Client Code'] === '100006');
+    expect(target['ICICI Bank Balance']).toBe(5700);
+    expect(rows.some((r) => r['ICICI Acc. No.'] === '000205041622')).toBe(false);
+    expect(exceptions.filter((e) => e['Issue'].startsWith('ICICI Balance Without'))).toHaveLength(0);
+  });
+
+  it('preserves the grand total when merging (money only moves rows)', () => {
+    const plain = buildDailyTracker(master, z10, ca, cw, meta, null, null);
+    const merged = buildDailyTracker(master, z10, ca, cw, meta, null, {
+      axisNames: { 'R JAGADISH': '100006' },
+      accounts: { '000205041622': '100006' },
+    });
+    expect(merged.summary.totalLiquidity).toBeCloseTo(plain.summary.totalLiquidity, 5);
+  });
+
+  it('is a no-op when the target code does not exist', () => {
+    const merges = { axisNames: { 'R JAGADISH': '999999' }, accounts: {} };
+    const { rows, exceptions } = buildDailyTracker(master, z10, ca, cw, meta, null, merges);
+    expect(rows.some((r) => r['Client Name'] === 'R JAGADISH')).toBe(true);
+    expect(exceptions.filter((e) => e['Issue'].startsWith('Axis Demat'))).toHaveLength(1);
+  });
+});
+
+describe('buildDailyTracker() — manual merge resolution ordering', () => {
+  const meta = { fileName: 'recon.xlsx', sheetName: 'WS Balances' };
+
+  it('resolves an ICICI merge onto a Z2-Axis-derived client created in a later loop', () => {
+    // 100200 exists ONLY via the Z2 Axis-orphan path (created after the ICICI loop).
+    const master = [
+      { 'WS Client Code': '100006', 'Client Name': 'Anchor', 'RM Name': 'Prashant', 'ICICI Acc. No.': '1111' },
+    ];
+    const z10 = [
+      { 'WS CLIENT ID': '100006', 'SECURITY TYPE DESCRIPTION': 'Equity', 'ASTCLSNAME': 'Stock', 'MKTVALUE': '1' },
+    ];
+    const ca = [
+      { 'Account Number': '000000001111', 'Effective Balance': '5000' },
+      { 'Account Number': '000000999888', 'Account Name': 'MYSTERY LLP', 'Effective Balance': '700' },
+    ];
+    const cw = [{ 'Client Name': 'SOME AXIS CLIENT', 'Ledger Bal BOD': '300' }];
+    const z2Rows = [
+      { CLIENTID: '100200', CLIENTCODE: '100200', CLIENTNAME: 'Some Axis Client', RMNAME: 'Rohit', 'TRADING BANK ACCOUNT': 'NONE' },
+    ];
+    const merges = { axisNames: {}, accounts: { '000000999888': '100200' } };
+
+    const { rows, exceptions, autoResolved } = buildDailyTracker(master, z10, ca, cw, meta, z2Rows, merges);
+
+    const target = rows.find((r) => r['WS Client Code'] === '100200');
+    expect(target['ICICI Bank Balance']).toBe(700); // credited despite later creation
+    expect(target['Axis Demat Balance']).toBe(300);
+    expect(rows.some((r) => r['ICICI Acc. No.'] === '000000999888')).toBe(false);
+    expect(exceptions.filter((e) => e['Issue'].startsWith('ICICI Balance Without'))).toHaveLength(0);
+    expect(autoResolved.some((a) => a['Resolved From'] === 'Saved manual mapping' && a['ICICI Acc. No.'] === '000000999888')).toBe(true);
+  });
+
+  it('falls back to an orphan row + exception when the mapping target no longer exists', () => {
+    const master = [
+      { 'WS Client Code': '100006', 'Client Name': 'Anchor', 'RM Name': 'Prashant', 'ICICI Acc. No.': '1111' },
+    ];
+    const z10 = [
+      { 'WS CLIENT ID': '100006', 'SECURITY TYPE DESCRIPTION': 'Equity', 'ASTCLSNAME': 'Stock', 'MKTVALUE': '1' },
+    ];
+    const ca = [
+      { 'Account Number': '000000001111', 'Effective Balance': '5000' },
+      { 'Account Number': '000000999888', 'Account Name': 'MYSTERY LLP', 'Effective Balance': '700' },
+    ];
+    const merges = { axisNames: {}, accounts: { '000000999888': '999999' } }; // 999999 gone
+
+    const { rows, exceptions, summary } = buildDailyTracker(master, z10, ca, [], meta, null, merges);
+    expect(rows.some((r) => r['ICICI Acc. No.'] === '000000999888')).toBe(true);
+    expect(exceptions.filter((e) => e['Issue'].startsWith('ICICI Balance Without'))).toHaveLength(1);
+    expect(summary.totalIcici).toBe(5700); // money still present and conserved
+  });
+})

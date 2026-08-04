@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   parseFile,
   parseWorkbookGrids,
@@ -8,8 +8,36 @@ import {
   exportDailyTrackerZip,
   exportMasterToXlsx,
   exportExceptionsToXlsx,
+  mergeTrackerRows,
   normalizeAccount,
+  normalizeNameKey,
 } from './liquidityProcessor';
+
+// localStorage key for orphan→client merge mappings saved from the fixer.
+const MANUAL_MERGES_KEY = 'onza-lt-manual-merges';
+const EMPTY_MANUAL_MERGES = { axisNames: {}, accounts: {} };
+
+function loadManualMerges() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(MANUAL_MERGES_KEY));
+    return {
+      axisNames: { ...(parsed?.axisNames || {}) },
+      accounts: { ...(parsed?.accounts || {}) },
+    };
+  } catch {
+    return { ...EMPTY_MANUAL_MERGES, axisNames: {}, accounts: {} };
+  }
+}
+
+function saveManualMerges(merges) {
+  try {
+    localStorage.setItem(MANUAL_MERGES_KEY, JSON.stringify(merges));
+  } catch {
+    // Storage unavailable (private mode) — mappings still apply this session.
+  }
+}
+
+const str = (v) => (v === null || v === undefined ? '' : String(v).trim());
 import { saveAs } from 'file-saver';
 import logo from './assets/gold_logo.png';
 import './App.css';
@@ -70,6 +98,12 @@ export default function App() {
   // result.exceptions. Cleared whenever a new build runs.
   const [exceptionFixes, setExceptionFixes] = useState({});
   const [applyingFixes, setApplyingFixes] = useState(false);
+  // Group keys ticked for a manual merge, in click order — the FIRST ticked
+  // client keeps its identity. Cleared whenever a new result is built.
+  const [mergeSelection, setMergeSelection] = useState([]);
+  // Saved orphan→client mappings (Axis names / ICICI accounts), persisted in
+  // localStorage and applied on every build.
+  const [manualMerges, setManualMerges] = useState(loadManualMerges);
   const fixerRef = useRef(null);
   const dropInputRef = useRef(null);
   // Mirror of `uploads` that async handlers can read/write without racing on
@@ -78,7 +112,7 @@ export default function App() {
 
   const allReady = Boolean(uploads.recon && uploads.z10 && uploads.cw);
 
-  const runBuild = (u) => {
+  const runBuild = (u, mergesOverride = null) => {
     if (!u.recon || !u.z10 || !u.cw) return;
     setProcessing(true);
     setError('');
@@ -96,7 +130,8 @@ export default function App() {
         caRows,
         cwRows,
         masterMeta,
-        z2Rows
+        z2Rows,
+        mergesOverride ?? manualMerges
       );
 
       setLastGeneratedAt((prev) => result?.generatedAt ?? prev);
@@ -273,7 +308,8 @@ export default function App() {
         parsedSources.caRows,
         parsedSources.cwRows,
         parsedSources.masterMeta,
-        parsedSources.z2Rows
+        parsedSources.z2Rows,
+        manualMerges
       );
 
       setResult(dailyTrackerResult);
@@ -433,6 +469,13 @@ export default function App() {
     return Array.from(new Set(result.rows.map((r) => r['RM Name']).filter(Boolean))).sort();
   }, [result]);
 
+  // If a merge/rebuild removes the last row for the filtered RM, that RM
+  // vanishes from rmOptions — reset the filter so the table doesn't silently
+  // empty behind a select stuck on a value that no longer exists.
+  useEffect(() => {
+    if (rmFilter !== 'all' && !rmOptions.includes(rmFilter)) setRmFilter('all');
+  }, [rmOptions, rmFilter]);
+
   const filteredRows = useMemo(() => {
     if (!result) return [];
     const q = search.trim().toLowerCase();
@@ -456,6 +499,122 @@ export default function App() {
     () => buildClientDisplayEntries(result?.rows ?? []),
     [result]
   );
+
+  // Any new/merged result invalidates the ticked rows.
+  useEffect(() => {
+    setMergeSelection([]);
+  }, [result]);
+
+  const toggleMergeSelect = (key) => {
+    setMergeSelection((prev) =>
+      prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]
+    );
+  };
+
+  const handleMergeSelected = () => {
+    if (!result || mergeSelection.length < 2) return;
+    const entriesByKey = new Map(allDisplayEntries.map((e) => [e.key, e]));
+    const selected = mergeSelection.map((k) => entriesByKey.get(k)).filter(Boolean);
+    if (selected.length < 2) return;
+
+    const primary = selected[0];
+    // mergeTrackerRows keeps the first ticked group's FIRST underlying row —
+    // quote that exact row (not the group's synthetic display aggregate) so
+    // the dialog matches what actually survives.
+    const survivor = primary.rows[0];
+    const recordCount = selected.reduce((s, e) => s + e.rows.length, 0);
+    const names = selected.map((e) => e.row['Client Name'] || '(blank name)');
+    const survivorLabel = `${survivor['Client Name'] || '(blank name)'}` +
+      (survivor['WS Client Code'] ? ` (code ${survivor['WS Client Code']}` : ' (') +
+      (survivor['RM Name'] ? `, RM ${survivor['RM Name']})` : ')');
+    const ok = window.confirm(
+      `Merge ${recordCount} record(s):\n\n- ${names.join('\n- ')}\n\n` +
+        `${survivorLabel} keeps its name, code, RM and account; ` +
+        'balances are added together and the other rows are removed.\n\n' +
+        'Merges apply to the current build only — rebuilding from files starts fresh.'
+    );
+    if (!ok) return;
+
+    setResult(mergeTrackerRows(result, selected.map((e) => e.rows)));
+  };
+
+  // Existing clients (with a WS code) an orphan exception can be merged into.
+  const mergeTargets = useMemo(() => {
+    if (!result) return [];
+    const seen = new Map();
+    for (const r of result.rows) {
+      const code = str(r['WS Client Code']);
+      if (code && !seen.has(code)) {
+        seen.set(code, `${r['Client Name'] || '(no name)'} — ${code}`);
+      }
+    }
+    return Array.from(seen, ([code, label]) => ({ code, label })).sort((a, b) =>
+      a.label.localeCompare(b.label)
+    );
+  }, [result]);
+
+  // Rebuild the tracker from the current (already-patched) master, re-applying
+  // the given saved merge mappings. Used when a mapping is added or removed.
+  const rebuildWithMerges = (merges) => {
+    if (!result || !parsedSources) return;
+    setError('');
+    try {
+      const master = result.finalMasterRows.map(({ Status, ...r }) => r);
+      const rebuilt = buildDailyTracker(
+        master,
+        parsedSources.z10Rows,
+        parsedSources.caRows,
+        parsedSources.cwRows,
+        parsedSources.masterMeta,
+        parsedSources.z2Rows,
+        merges
+      );
+      setResult(rebuilt);
+      // Resolving a merge removes an exception and shifts the positional
+      // indexes the fixer keys typed fixes by — clear them, as the other
+      // rebuild paths do, so no typed fix lands on the wrong client.
+      setExceptionFixes({});
+    } catch (err) {
+      setError(err.message || String(err));
+    }
+  };
+
+  // Maps an orphan exception's balance onto an existing client, saves the
+  // mapping (localStorage, applied on every future build), and rebuilds.
+  const saveOrphanMerge = (exc, targetCode) => {
+    const code = str(targetCode);
+    if (!code) return;
+    const next = {
+      axisNames: { ...manualMerges.axisNames },
+      accounts: { ...manualMerges.accounts },
+    };
+    const issue = exc['Issue'];
+    if (issue.startsWith('Axis Demat Balance Without Master Record')) {
+      const key = normalizeNameKey(exc['Client Name']);
+      if (!key) return;
+      next.axisNames[key] = code;
+    } else if (issue.startsWith('ICICI Balance Without Master Record')) {
+      const key = normalizeAccount(exc['ICICI Acc. No.']);
+      if (!key || key === 'N/A') return;
+      next.accounts[key] = code;
+    } else {
+      return;
+    }
+    setManualMerges(next);
+    saveManualMerges(next);
+    rebuildWithMerges(next);
+  };
+
+  const clearOrphanMerges = () => {
+    if (!window.confirm('Clear all saved orphan→client mappings on this computer?')) return;
+    const empty = { axisNames: {}, accounts: {} };
+    setManualMerges(empty);
+    saveManualMerges(empty);
+    rebuildWithMerges(empty);
+  };
+
+  const savedMergeCount =
+    Object.keys(manualMerges.axisNames).length + Object.keys(manualMerges.accounts).length;
 
   return (
     <div className="app">
@@ -700,9 +859,22 @@ export default function App() {
                   {filteredRows.length.toLocaleString('en-IN')} records · Subtotal{' '}
                   <strong>{INR.format(filteredTotal)}</strong>
                 </div>
+                <button
+                  className="btn btn-secondary"
+                  onClick={handleMergeSelected}
+                  disabled={mergeSelection.length < 2}
+                  title="Tick two or more rows — the first ticked client keeps its name, code, RM and account"
+                >
+                  Merge Selected Clients
+                  {mergeSelection.length > 0 ? ` (${mergeSelection.length})` : ''}
+                </button>
               </div>
 
-              <DailyTrackerTable entries={displayEntries} />
+              <DailyTrackerTable
+                entries={displayEntries}
+                mergeSelection={mergeSelection}
+                onToggleMergeSelect={toggleMergeSelect}
+              />
             </section>
 
             {fixableExceptions.length > 0 && (
@@ -715,6 +887,11 @@ export default function App() {
                 onUploadFixed={handleUploadFixedExcel}
                 applying={applyingFixes}
                 rmOptions={rmOptions}
+                mergeTargets={mergeTargets}
+                manualMerges={manualMerges}
+                onSaveMerge={saveOrphanMerge}
+                savedMergeCount={savedMergeCount}
+                onClearMerges={clearOrphanMerges}
               />
             )}
           </>
@@ -794,8 +971,18 @@ const FIXABLE_FIELDS = {
   },
 };
 
+const MERGEABLE_ISSUE_PREFIXES = [
+  'Axis Demat Balance Without Master Record',
+  'ICICI Balance Without Master Record',
+];
+const isMergeableIssue = (issue) =>
+  MERGEABLE_ISSUE_PREFIXES.some((p) => String(issue).startsWith(p));
+
 const ExceptionFixerSection = React.forwardRef(function ExceptionFixerSection(
-  { fixableExceptions, fixes, onChange, onApply, onUploadFixed, applying, rmOptions },
+  {
+    fixableExceptions, fixes, onChange, onApply, onUploadFixed, applying, rmOptions,
+    mergeTargets = [], onSaveMerge = () => {}, savedMergeCount = 0, onClearMerges = () => {},
+  },
   ref
 ) {
   const uploadInputRef = useRef(null);
@@ -812,9 +999,11 @@ const ExceptionFixerSection = React.forwardRef(function ExceptionFixerSection(
           <p className="panel-meta" style={{ marginTop: 6 }}>
             Fill in the missing details below — or upload the corrected Exception
             Report via <em>Upload Fixed Excel</em> — and click{' '}
-            <em>Apply fixes &amp; rebuild</em>. The patched master is used for the
-            new tracker run, and is also what gets included in{' '}
-            <em>Export Updated Z0 Client Master</em>.
+            <em>Apply fixes &amp; rebuild</em>. For a duplicate that&rsquo;s really an
+            existing client under a different name (e.g. an Axis name mismatch), pick
+            that client under <em>Merge into existing client</em> — its balance folds in
+            and the mapping is <strong>remembered on this computer</strong> for every
+            future build.
           </p>
         </div>
         <div className="actions">
@@ -825,6 +1014,11 @@ const ExceptionFixerSection = React.forwardRef(function ExceptionFixerSection(
             onChange={onUploadFixed}
             style={{ display: 'none' }}
           />
+          {savedMergeCount > 0 && (
+            <button className="btn btn-secondary" onClick={onClearMerges} disabled={applying}>
+              Clear saved mappings ({savedMergeCount})
+            </button>
+          )}
           <button
             className="btn btn-secondary"
             onClick={() => uploadInputRef.current?.click()}
@@ -859,12 +1053,14 @@ const ExceptionFixerSection = React.forwardRef(function ExceptionFixerSection(
               <th>Client Name</th>
               <th>RM Name</th>
               <th>ICICI Acc. No.</th>
+              <th>Merge into existing client</th>
             </tr>
           </thead>
           <tbody>
             {fixableExceptions.map(({ exc, idx }) => {
               const allow = FIXABLE_FIELDS[exc['Issue']] || {};
               const fix = fixes[idx] || {};
+              const mergeable = isMergeableIssue(exc['Issue']);
               return (
                 <tr key={idx}>
                   <td>{exc['Issue']}</td>
@@ -930,6 +1126,28 @@ const ExceptionFixerSection = React.forwardRef(function ExceptionFixerSection(
                       </div>
                     ) : (
                       exc['ICICI Acc. No.'] || <span className="muted">—</span>
+                    )}
+                  </td>
+                  <td>
+                    {mergeable ? (
+                      <select
+                        className="fix-input merge-select"
+                        value=""
+                        disabled={applying}
+                        onChange={(e) => {
+                          const code = e.target.value;
+                          if (code) onSaveMerge(exc, code);
+                        }}
+                      >
+                        <option value="">Keep separate…</option>
+                        {mergeTargets.map((t) => (
+                          <option key={t.code} value={t.code}>
+                            {t.label}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <span className="muted">—</span>
                     )}
                   </td>
                 </tr>
@@ -1002,7 +1220,7 @@ function buildClientDisplayEntries(rows) {
   }));
 }
 
-function DailyTrackerTable({ entries }) {
+function DailyTrackerTable({ entries, mergeSelection = [], onToggleMergeSelect = () => {} }) {
   const [sort, setSort] = useState({ col: null, dir: 'desc' });
   const [expanded, setExpanded] = useState(() => new Set());
 
@@ -1063,6 +1281,7 @@ function DailyTrackerTable({ entries }) {
       <table className="tracker-table">
         <thead>
           <tr>
+            <th className="select-col" aria-label="Select rows to merge" />
             <SortTh col="RM Name">RM / Client Partner</SortTh>
             <SortTh col="WS Client Code">WS Client Code</SortTh>
             <SortTh col="Client Name">Client Name</SortTh>
@@ -1086,6 +1305,14 @@ function DailyTrackerTable({ entries }) {
                 key={`${entry.key}-parent`}
                 className={`band-${bandIndex % 2}${entry.isGrouped ? ' grouped-parent' : ''}`}
               >
+                <td className="select-col">
+                  <input
+                    type="checkbox"
+                    checked={mergeSelection.includes(entry.key)}
+                    onChange={() => onToggleMergeSelect(entry.key)}
+                    aria-label={`Select ${r['Client Name'] || 'row'} for merge`}
+                  />
+                </td>
                 <td>{r['RM Name'] || <span className="muted">—</span>}</td>
                 <td className="mono">{r['WS Client Code']}</td>
                 <td>
@@ -1117,6 +1344,7 @@ function DailyTrackerTable({ entries }) {
             if (!entry.isGrouped || !isOpen) return [parent];
             const children = entry.rows.map((child, childIndex) => (
               <tr key={`${entry.key}-child-${childIndex}`} className="grouped-child">
+                <td className="select-col" />
                 <td>{child['RM Name'] || <span className="muted">—</span>}</td>
                 <td className="mono">{child['WS Client Code']}</td>
                 <td>{child['Client Name']}</td>

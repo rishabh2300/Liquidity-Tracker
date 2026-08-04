@@ -468,9 +468,10 @@ function buildCurrentAccountMapping(caRows) {
 /**
  * Join key for client names: collapses whitespace runs and uppercases.
  * Axis exports carry double internal spaces ("VELLACHI  MURUGAPPAN") that
- * a plain toUpperCase() join misses.
+ * a plain toUpperCase() join misses. Exported because the UI uses the same
+ * key for saved manual merge mappings.
  */
-function normalizeNameKey(v) {
+export function normalizeNameKey(v) {
   return str(v).replace(/\s+/g, ' ').toUpperCase();
 }
 
@@ -696,8 +697,10 @@ const CA_COLS = ['Account Number', 'Available Balance'];
  * Current Account Data contributes ICICI cash balances.
  * z2Input (optional) is the Z2 Client Master — raw rows or a prebuilt
  * enrichment — used to auto-fill missing RM names and resolve orphans.
+ * manualMerges (optional) holds user-saved mappings of orphan balances onto
+ * existing clients: { axisNames: { nameKey: wsCode }, accounts: { paddedAccount: wsCode } }.
  */
-export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMeta = {}, z2Input = null) {
+export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMeta = {}, z2Input = null, manualMerges = null) {
   const safeMaster = normalizeMasterRows(masterRows);
   const safeZ10 = extractArray(z10Rows);
   const safeCa = extractArray(caRows, ['ICICI Balances', 'ICICI Balance']);
@@ -724,6 +727,13 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
   // loop so excluded test clients and Z2-filled RM names carry through.
   const finalMasterRows = [];
   const masterCodes = new Set();
+  // Tracker row per client code, so saved manual mappings can credit orphan
+  // balances onto an existing client's row.
+  const rowByCode = new Map();
+  const mergeMap = manualMerges || {};
+  // Saved manual merges are resolved in ONE pass after every row exists, so a
+  // mapping onto a client whose row is created in a later loop still lands.
+  const pendingMerges = [];
   // Balances belonging to excluded test clients must not re-enter the totals
   // through the orphan auto-add loops below.
   const excludedAccountKeys = new Set();
@@ -858,7 +868,7 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
 
     const totalLiquidity = iciciBalance + liquidMf + axisBalance;
 
-    rows.push({
+    const trackerRow = {
       'RM Name': rmName,
       'WS Client Code': clientCode,
       'Client Name': str(mRow['Client Name']),
@@ -867,7 +877,9 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
       'Liquid MF Balance': liquidMf,
       'Axis Demat Balance': axisBalance,
       'Total Liquidity': totalLiquidity,
-    });
+    };
+    rows.push(trackerRow);
+    if (!rowByCode.has(clientCode)) rowByCode.set(clientCode, trackerRow);
   });
 
   // Auto-add Z10 clients whose code has no Master record — they would
@@ -883,7 +895,7 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
     if (!(z2Hit && z2Hit.rmName)) orphanLiquidMf += bal;
     const clientName = z10Names[code] || z2Hit?.name || '';
     const rmName = z2Hit?.rmName || '';
-    rows.push({
+    const orphanRow = {
       'RM Name': rmName,
       'WS Client Code': code,
       'Client Name': clientName,
@@ -892,7 +904,9 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
       'Liquid MF Balance': bal,
       'Axis Demat Balance': 0,
       'Total Liquidity': bal,
-    });
+    };
+    rows.push(orphanRow);
+    if (!rowByCode.has(code)) rowByCode.set(code, orphanRow);
     finalMasterRows.push({
       'WS Client Code': code,
       'Client Name': clientName,
@@ -963,6 +977,19 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
       continue;
     }
 
+    // Saved manual mapping: defer to the post-loop pass so the target row is
+    // guaranteed to exist regardless of which loop created it.
+    if (mergeMap.accounts?.[paddedAcct]) {
+      pendingMerges.push({
+        kind: 'icici',
+        target: mergeMap.accounts[paddedAcct],
+        balance: info.balance,
+        account: paddedAcct,
+        accountName: info.accountName,
+      });
+      continue;
+    }
+
     const z2Hit = z2 ? z2.byAccount.get(paddedAcct) : null;
     if (z2Hit && z2Hit.code && !masterCodes.has(z2Hit.code)) {
       masterCodes.add(z2Hit.code);
@@ -974,7 +1001,7 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
         resolvedAxis = axisBalances[resolvedNameKey];
         creditedAxisNames.add(resolvedNameKey);
       }
-      rows.push({
+      const z2Row = {
         'RM Name': z2Hit.rmName,
         'WS Client Code': z2Hit.code,
         'Client Name': z2Hit.name || info.accountName,
@@ -983,7 +1010,9 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
         'Liquid MF Balance': 0,
         'Axis Demat Balance': resolvedAxis,
         'Total Liquidity': info.balance + resolvedAxis,
-      });
+      };
+      rows.push(z2Row);
+      if (!rowByCode.has(z2Hit.code)) rowByCode.set(z2Hit.code, z2Row);
       finalMasterRows.push({
         'WS Client Code': z2Hit.code,
         'Client Name': z2Hit.name || info.accountName,
@@ -1039,10 +1068,22 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
     const displayName = axisNames[nameKey] || nameKey;
     const axisCode = axisCodes[nameKey] || '';
 
+    // Saved manual mapping: defer to the post-loop pass (see ICICI loop).
+    if (mergeMap.axisNames?.[nameKey]) {
+      pendingMerges.push({
+        kind: 'axis',
+        target: mergeMap.axisNames[nameKey],
+        balance: bal,
+        displayName,
+        axisCode,
+      });
+      continue;
+    }
+
     const z2Hit = z2 ? z2.byName.get(nameKey) : null;
     if (z2Hit && z2Hit.code && !masterCodes.has(z2Hit.code)) {
       masterCodes.add(z2Hit.code);
-      rows.push({
+      const z2AxisRow = {
         'RM Name': z2Hit.rmName,
         'WS Client Code': z2Hit.code,
         'Client Name': z2Hit.name || displayName,
@@ -1051,7 +1092,9 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
         'Liquid MF Balance': 0,
         'Axis Demat Balance': bal,
         'Total Liquidity': bal,
-      });
+      };
+      rows.push(z2AxisRow);
+      if (!rowByCode.has(z2Hit.code)) rowByCode.set(z2Hit.code, z2AxisRow);
       finalMasterRows.push({
         'WS Client Code': z2Hit.code,
         'Client Name': z2Hit.name || displayName,
@@ -1097,6 +1140,55 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
     });
   }
 
+  // Resolve saved manual merges now that every tracker row exists. When the
+  // target still exists, fold the orphan balance in; otherwise the mapping is
+  // stale (target removed) — fall back to the normal orphan row + exception so
+  // the money still appears and totals stay conserved.
+  for (const p of pendingMerges) {
+    const targetRow = rowByCode.get(p.target);
+    if (targetRow && p.kind === 'icici') {
+      targetRow['ICICI Bank Balance'] += p.balance;
+      targetRow['Total Liquidity'] += p.balance;
+      autoResolved.push({
+        'Type': 'ICICI balance merged into existing client',
+        'Client Code': p.target, 'Client Name': targetRow['Client Name'], 'RM Name': targetRow['RM Name'],
+        'ICICI Acc. No.': p.account, 'Amount': p.balance, 'Resolved From': 'Saved manual mapping',
+      });
+    } else if (targetRow && p.kind === 'axis') {
+      targetRow['Axis Demat Balance'] += p.balance;
+      targetRow['Total Liquidity'] += p.balance;
+      autoResolved.push({
+        'Type': 'Axis Demat balance merged into existing client',
+        'Client Code': p.target, 'Client Name': targetRow['Client Name'], 'RM Name': targetRow['RM Name'],
+        'ICICI Acc. No.': '', 'Amount': p.balance, 'Resolved From': 'Saved manual mapping',
+      });
+    } else if (p.kind === 'icici') {
+      // Stale mapping — target gone. Emit as a normal ICICI orphan.
+      orphanIciciCash += p.balance;
+      rows.push({
+        'RM Name': '', 'WS Client Code': '', 'Client Name': p.accountName, 'ICICI Acc. No.': p.account,
+        'ICICI Bank Balance': p.balance, 'Liquid MF Balance': 0, 'Axis Demat Balance': 0, 'Total Liquidity': p.balance,
+      });
+      exceptions.push({
+        'Issue': 'ICICI Balance Without Master Record (auto-added)', 'Master Row': '',
+        'Source File': masterMeta.fileName || '', 'Sheet Name': masterMeta.sheetName || '',
+        'Client Code': '', 'Client Name': p.accountName, 'RM Name': '', 'ICICI Acc. No.': p.account, 'Liquid MF Balance': '',
+      });
+    } else {
+      // Stale Axis mapping — emit as a normal Axis orphan.
+      orphanAxisCash += p.balance;
+      rows.push({
+        'RM Name': '', 'WS Client Code': '', 'Client Name': p.displayName, 'ICICI Acc. No.': '',
+        'ICICI Bank Balance': 0, 'Liquid MF Balance': 0, 'Axis Demat Balance': p.balance, 'Total Liquidity': p.balance,
+      });
+      exceptions.push({
+        'Issue': 'Axis Demat Balance Without Master Record (auto-added)', 'Master Row': '',
+        'Source File': masterMeta.fileName || '', 'Sheet Name': masterMeta.sheetName || '',
+        'Client Code': p.axisCode, 'Client Name': p.displayName, 'RM Name': '', 'ICICI Acc. No.': '', 'Liquid MF Balance': '',
+      });
+    }
+  }
+
   rows.sort((a, b) => {
     const rmA = a['RM Name'];
     const rmB = b['RM Name'];
@@ -1127,10 +1219,17 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
       `Excluded ${testClientsExcluded} test client row(s) (RM "Test RM" / dummy account) from the tracker and totals.`
     );
   }
-  if (z2 && (rmFilledFromZ2 > 0 || autoResolved.length > 0)) {
+  const z2ResolvedCount = autoResolved.filter((a) => a['Resolved From'] === 'Z2 Client Master').length;
+  const manualMergeCount = autoResolved.filter((a) => a['Resolved From'] === 'Saved manual mapping').length;
+  if (z2 && (rmFilledFromZ2 > 0 || z2ResolvedCount > 0)) {
     warnings.push(
       `Z2 Client Master: auto-filled ${rmFilledFromZ2} RM name(s) and resolved ` +
-      `${autoResolved.length} unmatched record(s) — no manual fixing needed for these.`
+      `${z2ResolvedCount} unmatched record(s) — no manual fixing needed for these.`
+    );
+  }
+  if (manualMergeCount > 0) {
+    warnings.push(
+      `${manualMergeCount} orphan balance(s) merged into existing clients via saved mappings.`
     );
   }
   if (!z2 && (clientsWithoutRm > 0 || orphanIciciCash > 0 || orphanLiquidMf > 0 || Math.abs(orphanAxisCash) > 0.5)) {
@@ -1252,6 +1351,52 @@ export function buildDynamicMaster(wsBalancesRows, z10Rows) {
   });
 
   return { rows: dynamicMaster };
+}
+
+// -----------------------------------------------------------------------------
+// Manual client merge
+// -----------------------------------------------------------------------------
+
+/**
+ * Merges the tracker rows of manually selected clients into one row —
+ * used when the same person appears under mismatched names across bank and
+ * demat files (e.g. "R JAGADISH" vs "Ramamoorthi Jagadish").
+ *
+ * selectedGroups is an array, in selection order, of row-object arrays taken
+ * from result.rows BY REFERENCE. The first group's first row is the primary:
+ * it keeps its RM Name, WS Client Code, Client Name, and ICICI Acc. No.;
+ * the financial columns become the sum across every selected row. All other
+ * selected rows are removed. Returns a new result with rows and the
+ * client/RM summary counts updated (money totals are unchanged by a merge).
+ */
+export function mergeTrackerRows(result, selectedGroups) {
+  const flat = (selectedGroups || []).flat();
+  if (!result || flat.length < 2) return result;
+
+  const primaryRow = selectedGroups[0][0];
+  const sum = (col) => flat.reduce((s, r) => s + (r[col] || 0), 0);
+  const mergedRow = {
+    ...primaryRow,
+    'ICICI Bank Balance': sum('ICICI Bank Balance'),
+    'Liquid MF Balance': sum('Liquid MF Balance'),
+    'Axis Demat Balance': sum('Axis Demat Balance'),
+    'Total Liquidity': sum('Total Liquidity'),
+  };
+
+  const dropped = new Set(flat);
+  const rows = result.rows
+    .map((r) => (r === primaryRow ? mergedRow : r))
+    .filter((r) => r === mergedRow || !dropped.has(r));
+
+  return {
+    ...result,
+    rows,
+    summary: {
+      ...result.summary,
+      totalClients: rows.length,
+      totalRMs: new Set(rows.map((r) => r['RM Name']).filter(Boolean)).size,
+    },
+  };
 }
 
 // -----------------------------------------------------------------------------
