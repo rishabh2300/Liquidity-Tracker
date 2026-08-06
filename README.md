@@ -95,9 +95,8 @@ Local Tauri builds require Rust and the platform-specific Tauri build dependenci
 
 ## Releasing an Update
 
-Installed desktop apps check for updates on every launch against the public
-releases repo (`rishabh2300/liquidity-tracker-releases`) and offer to install
-newer versions automatically. To ship a release:
+Installed desktop apps check this repo's GitHub Releases on every launch and
+offer to install newer versions automatically. To ship a release:
 
 1. Bump `version` in `src-tauri/tauri.conf.json` (e.g. `1.1.0` → `1.2.0`) and
    commit & push.
@@ -107,11 +106,10 @@ newer versions automatically. To ship a release:
    git tag app-v1.2.0 && git push origin app-v1.2.0
    ```
 
-3. GitHub Actions (`Build Windows Release`) builds the signed installers and
-   uploads them with `latest.json` as a **draft** release on the public
-   releases repo.
-4. Publish the draft there — every installed PC gets the update prompt on its
-   next launch.
+3. GitHub Actions (`Build Windows Release`) builds the signed installer and
+   uploads it with `latest.json` as a **draft** release on this repo.
+4. Publish the draft — every installed PC gets the update prompt on its next
+   launch.
 
 Required repository secrets (Settings → Secrets and variables → Actions):
 
@@ -120,9 +118,9 @@ Required repository secrets (Settings → Secrets and variables → Actions):
   2026-07-28).
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` — the key's password
   (`~/.tauri/liquidity-tracker-updater.password.txt` on the same machine).
-- `RELEASES_TOKEN` — fine-grained PAT with read/write **Contents** permission
-  on `liquidity-tracker-releases`, so CI in this (private) repo can publish
-  releases to the public one.
+
+Releases go to this same repo, so the workflow's built-in `GITHUB_TOKEN` is
+sufficient — no personal access token needed.
 
 Losing the signing key or its password means future updates can't be signed —
 keep copies somewhere safe outside this machine.

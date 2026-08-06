@@ -37,7 +37,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/rishabh2300/liquidity-tracker-releases/releases/latest/download/latest.json"
+        "https://github.com/rishabh2300/Liquidity-Tracker/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVBMzVDM0M2NUYyRDE2NjEKUldSaEZpMWZ4c00xV29Gd3drV0hMNWpnMmptcVFrSXhNclJCcTRxSEVKWlpYOEVHQXhscXlWWmYK"
     }
