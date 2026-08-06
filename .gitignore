@@ -44,3 +44,6 @@ src/assets/8K mark 01 .webp
 /*.xlsm
 /*.xls
 /*.csv
+
+# Updater signing secrets (private key + password) — NEVER commit; public repo
+/SIGNING-SECRETS.local.txt
