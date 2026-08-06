@@ -39,13 +39,44 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      # Fail fast with a clear message if the signing secret is missing or
+      # malformed (e.g. a stray space, or the copy COMMAND pasted instead of
+      # the key), instead of discovering it after a 7-minute compile. Also
+      # strips accidental whitespace so a slightly-mangled paste still works.
+      # No key material is ever printed.
+      - name: Validate signing secrets
+        shell: bash
+        env:
+          RAW_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          RAW_PW: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          KEY="$(printf '%s' "$RAW_KEY" | tr -d '[:space:]')"
+          PW="$(printf '%s' "$RAW_PW" | tr -d '\r\n')"
+          if [ -z "$KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is empty or unset."
+            exit 1
+          fi
+          if [ -z "$PW" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY_PASSWORD is empty — the updater key is password-protected."
+            exit 1
+          fi
+          HEAD="$(printf '%s' "$KEY" | base64 -d 2>/dev/null | head -c 18 || true)"
+          if [ "$HEAD" != "untrusted comment:" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY does not decode to a minisign key (${#KEY} chars). The secret must hold the base64 CONTENTS of liquidity-tracker-updater.key — not a command line, a file path, or the .pub file. Run the pbcopy command in Terminal, then paste the clipboard into the secret."
+            exit 1
+          fi
+          echo "Signing key looks valid (${#KEY} chars after whitespace cleanup)."
+          echo "::add-mask::$KEY"
+          {
+            echo "TAURI_SIGNING_PRIVATE_KEY=$KEY"
+            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$PW"
+          } >> "$GITHUB_ENV"
+
       - uses: tauri-apps/tauri-action@v0
         env:
           # Built-in token — sufficient because we release to this same repo.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Updater artifact signing (keypair of 2026-07-28).
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Signing env vars come pre-validated from the step above.
         with:
           # We ship NSIS only; keep latest.json pointing at the .exe.
           updaterJsonPreferNsis: true
