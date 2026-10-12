@@ -229,6 +229,42 @@ h1, h2, h3, h4, h5, h6 {
   }
 }
 
+/* Five cards across. minmax(0, 1fr) — not bare 1fr — so a column can shrink
+   below its content's minimum width; otherwise the file chip (nowrap name +
+   size) sets a ~234px floor per card and five of them overflow the panel. */
+.file-grid-5 {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+@media (max-width: 1100px) {
+  .file-grid-5 {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 700px) {
+  .file-grid-5 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* In the narrow five-up cards the file chip stacks: the (ellipsized) file name
+   on one line, the size or "exported <date>" stamp beneath it, so neither
+   pushes the card wider than its column. */
+.file-grid-5 .file-slot-file {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.file-grid-5 .file-name {
+  max-width: 100%;
+}
+
+.file-grid-5 .file-size {
+  white-space: nowrap;
+}
+
 .file-slot {
   border: 2px dashed var(--border-subtle);
   border-radius: var(--radius-md);

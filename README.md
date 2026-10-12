@@ -6,7 +6,7 @@ The app runs locally in the browser during development and is packaged as a Wind
 
 ## What It Does
 
-- Reads the Z0 Client Master, Bank Recon, Z10 Holding / AssetClass, and Client Wise Axis Ledger files.
+- Reads the Bank Recon, Z10 Holding / AssetClass, and Client Wise Axis Ledger files, plus the optional Z2 Client Master and Current Account Data exports.
 - Reconciles the master against Bank Recon client/account data.
 - Builds a consolidated liquidity view by client and RM.
 - Combines ICICI cash, Liquid MF, and Axis Demat balances.
@@ -29,10 +29,21 @@ the three required reports are present:
 | Z10 Holding / AssetClass | Yes | `WS CLIENT ID`, `SECURITY TYPE DESCRIPTION`, `ASTCLSNAME`, `MKTVALUE` (pivot sheets are skipped) |
 | Client Wise (Axis) | Yes | `Client Name`, `Ledger Bal BOD` |
 | Z2 Client Master | Optional | `CLIENTID`, `CLIENTCODE`, `CLIENTNAME`, `RMNAME`, `TRADING BANK ACCOUNT` |
+| Current Account Data | Optional | The raw ICICI portal export on its own: `Account Number` + `Available Balance` / `Effective Balance` (title rows and the "Date and Time" footer are fine) |
 
 When the Z2 Client Master is included, missing RM names and unmatched
 accounts/holdings are auto-resolved from it and listed on an "Auto-Resolved"
 sheet in the exception report.
+
+When a Current Account Data export (the raw ICICI portal download) is
+included, its balances replace the Bank Recon's `ICICI Balances` sheet, so the
+tracker can run on today's cash position before the recon is finished. The
+build notes name the file that supplied the balances and warn when its
+"Date and Time" footer is older than the recon (the WS Balances `AS ON DATE`
+or the recon summary's `Balance Date`, whichever is later) — a stale download.
+A Bank Recon workbook that lacks its `WS Balances` sheet is still rejected with
+a hint; only the raw portal export is accepted as Current Account Data.
+Removing the file rebuilds from the recon's own sheet.
 
 Standing rules: test clients (RM "Test RM" / dummy account) are excluded from
 the tracker and totals; Onza's own current account appears as a row under

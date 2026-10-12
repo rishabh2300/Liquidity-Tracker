@@ -69,6 +69,12 @@ const ROLE_META = [
     required: false,
     hint: 'Optional — auto-fills RM names & unmatched accounts',
   },
+  {
+    key: 'ca',
+    label: 'Current Account Data',
+    required: false,
+    hint: "Optional — raw ICICI portal export; its balances override the Bank Recon's ICICI Balances sheet",
+  },
 ];
 
 const INR = new Intl.NumberFormat('en-IN', {
@@ -78,7 +84,7 @@ const INR = new Intl.NumberFormat('en-IN', {
 });
 
 export default function App() {
-  // Files identified by content, keyed by role: { recon, z10, cw, z2 },
+  // Files identified by content, keyed by role: { recon, z10, cw, z2, ca },
   // each entry { file, cls } where cls carries the extracted table rows.
   const [uploads, setUploads] = useState({});
   const [fileNotes, setFileNotes] = useState([]);
@@ -117,13 +123,32 @@ export default function App() {
     setProcessing(true);
     setError('');
     try {
-      const { wsRows, caRows, wsSheet } = u.recon.cls;
+      const { wsRows, caRows: reconCaRows, wsSheet } = u.recon.cls;
       const z10Rows = u.z10.cls.z10Rows;
       const cwRows = u.cw.cls.cwRows;
       const z2Rows = u.z2 ? u.z2.cls.z2Rows : null;
+      // A separately uploaded Current Account export (the raw ICICI portal
+      // table) overrides the recon's ICICI Balances sheet as the cash source,
+      // so the tracker can run on today's balances before the recon is done.
+      const caUpload = u.ca || null;
+      const caRows = caUpload ? caUpload.cls.caRows : reconCaRows;
 
       const masterResult = buildDynamicMaster(wsRows, z10Rows);
-      const masterMeta = { fileName: u.recon.file.name, sheetName: wsSheet || 'WS Balances' };
+      const masterMeta = {
+        fileName: u.recon.file.name,
+        sheetName: wsSheet || 'WS Balances',
+        asOnDate: masterResult.asOnDate,
+        reconBalanceDate: u.recon.cls.balanceDate || '',
+        ...(caUpload
+          ? {
+              currentAccount: {
+                fileName: caUpload.file.name,
+                sheetName: caUpload.cls.sheet || '',
+                exportedAt: caUpload.cls.exportedAt || '',
+              },
+            }
+          : {}),
+      };
       const dailyTrackerResult = buildDailyTracker(
         masterResult.rows,
         z10Rows,
@@ -164,7 +189,7 @@ export default function App() {
         try {
           const parsed = await parseWorkbookGrids(file);
           const cls = classifyWorkbook(parsed);
-          if (cls.role === 'recon' || cls.role === 'z10' || cls.role === 'cw' || cls.role === 'z2') {
+          if (['recon', 'z10', 'cw', 'z2', 'ca'].includes(cls.role)) {
             const displaced = additions[cls.role] || uploadsRef.current[cls.role];
             if (displaced && (displaced.file.name !== file.name || displaced.file.size !== file.size)) {
               const label = ROLE_META.find((r) => r.key === cls.role)?.label || cls.role;
@@ -187,7 +212,7 @@ export default function App() {
               level: 'warn',
               message:
                 cls.hint ||
-                'Not recognized. Expected: Bank Recon, Z10 Holdings, Client Wise (Axis), or Z2 Client Master.',
+                'Not recognized. Expected: Bank Recon, Z10 Holdings, Client Wise (Axis), Z2 Client Master, or Current Account Data.',
             });
           }
         } catch (err) {
@@ -215,11 +240,18 @@ export default function App() {
     uploadsRef.current = next;
     setUploads(next);
     setFileNotes([]);
+    setError('');
+    // Removing an optional file (Z2 / Current Account Data) leaves the three
+    // required reports in place — rebuild on them right away, so dropping the
+    // Current Account override falls straight back to the recon's own sheet.
+    if (next.recon && next.z10 && next.cw) {
+      runBuild(next);
+      return;
+    }
     setResult(null);
     setMasterResult(null);
     setParsedSources(null);
     setExceptionFixes({});
-    setError('');
   };
 
   const handleReset = () => {
@@ -677,11 +709,12 @@ export default function App() {
             </p>
             <p className="dropzone-hint">
               Any file names, any order. Each file is identified by its contents, and the
-              tracker builds itself once the three required reports are in.
+              tracker builds itself once the three required reports are in — adding or
+              removing an optional file rebuilds it.
             </p>
           </div>
 
-          <div className="file-grid file-grid-4">
+          <div className="file-grid file-grid-5">
             {ROLE_META.map((role) => (
               <RoleCard
                 key={role.key}
@@ -902,9 +935,10 @@ export default function App() {
             <p className="empty-title">Ready to build</p>
             <p className="empty-body">
               Drop the daily files above — Bank Recon, Z10 Holdings, and Client Wise
-              (plus the optional Z2 Client Master for automatic RM mapping). Each file is
-              recognized by its contents and the tracker builds itself; no naming, ordering,
-              or slot-picking needed.
+              (plus the optional Z2 Client Master for automatic RM mapping, and the optional
+              Current Account Data export to use today's ICICI balances instead of the
+              recon's sheet). Each file is recognized by its contents and the tracker builds
+              itself; no naming, ordering, or slot-picking needed.
             </p>
           </section>
         )}
@@ -940,7 +974,11 @@ function RoleCard({ role, upload, onClear }) {
       {upload ? (
         <div className="file-slot-file">
           <span className="file-name">{upload.file.name}</span>
-          <span className="file-size">{(upload.file.size / 1024).toFixed(1)} KB</span>
+          <span className="file-size">
+            {upload.cls?.exportedAt
+              ? `exported ${upload.cls.exportedAt.split(' ')[0]}`
+              : `${(upload.file.size / 1024).toFixed(1)} KB`}
+          </span>
         </div>
       ) : (
         <p className="file-slot-waiting">

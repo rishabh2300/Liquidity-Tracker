@@ -205,31 +205,49 @@ export function findTable(parsed, requiredCols, { maxScanRows = 40 } = {}) {
 }
 
 // Column fingerprints that uniquely identify each source report. Verified
-// against real exports: no fingerprint matches any sheet of another report
-// (the Z10 pivots lack WS CLIENT ID/ASTCLSNAME; the recon-summary sheet's
-// lookalike headers are space-padded variants that still exact-match nothing).
+// against real exports: no fingerprint matches a sheet of another report (the
+// Z10 pivots lack WS CLIENT ID/ASTCLSNAME). One deliberate overlap: the recon's
+// own summary sheet ("Bank Recon ddmmyy") matches RECON_SUMMARY_FINGERPRINTS —
+// headers are trimmed before matching, so its space-padded
+// " Sum of Bank Balance (Custody) " does match — which is how a Bank Recon that
+// is missing its WS Balances sheet is told apart from a raw ICICI export.
 const WS_MASTER_COLS = ['CLIENT_CODE', 'CLIENTNAME', 'BANK_ACCOUNT'];
 const CA_EFFECTIVE_COLS = ['Account Number', 'Effective Balance'];
+// Shapes of the raw ICICI portal export (the recon's ICICI Balances sheet is a
+// paste of it), in preference order. Only these qualify as a standalone
+// Current Account Data upload.
+const CA_PORTAL_FINGERPRINTS = [
+  ['Account Number', 'Available Balance'],
+  CA_EFFECTIVE_COLS,
+  ['Account No', 'Available Balance'],
+  ['ACCOUNT_NUMBER', 'Available Balance'],
+];
+// The recon's summary sheet: a per-account balance table that can stand in for
+// the ICICI sheet INSIDE a Bank Recon workbook, but is never a Current Account
+// export on its own.
+const RECON_SUMMARY_FINGERPRINTS = [
+  ['Bank Account', 'Sum of Bank Balance (Custody)'],
+  ['Bank Account', 'Sum of Bank Balance (System)'],
+];
 const CW_COLS = ['Client Name', 'Ledger Bal BOD'];
 const Z2_COLS = ['CLIENTID', 'CLIENTCODE', 'CLIENTNAME', 'RMNAME', 'TRADING BANK ACCOUNT'];
 const CLHR_COLS = ['Ent Id', 'Ent Name', 'Free Valuation'];
 
 /**
  * Identifies which daily report a parsed workbook is, by content.
- * Roles: 'recon' (WS Balances + ICICI Balances), 'z2', 'z10', 'cw',
- * 'clhr' (recognized but unused), 'unknown' (with a hint when possible).
+ * Roles: 'recon' (WS Balances + ICICI Balances), 'ca' (a balances-only
+ * Current Account export straight from the ICICI portal — the same table as
+ * the recon's ICICI Balances sheet, uploaded on its own to override it),
+ * 'z2', 'z10', 'cw', 'clhr' (recognized but unused), 'unknown' (with a hint
+ * when possible).
  */
 export function classifyWorkbook(parsed) {
   const ws = findTable(parsed, WS_MASTER_COLS);
-  // CA header variants in preference order — the canonical ICICI-portal pair
-  // first, then the aliases normalizeCAColumns has always tolerated.
-  const ca =
-    findTable(parsed, CA_COLS) ||
-    findTable(parsed, CA_EFFECTIVE_COLS) ||
-    findTable(parsed, ['Account No', 'Available Balance']) ||
-    findTable(parsed, ['ACCOUNT_NUMBER', 'Available Balance']) ||
-    findTable(parsed, ['Bank Account', 'Sum of Bank Balance (Custody)']) ||
-    findTable(parsed, ['Bank Account', 'Sum of Bank Balance (System)']);
+  // Portal-shaped balance table first (the canonical ICICI pair, then the
+  // aliases normalizeCAColumns has always tolerated), else the recon summary.
+  const caPortal = findFirstTable(parsed, CA_PORTAL_FINGERPRINTS);
+  const reconSummary = findFirstTable(parsed, RECON_SUMMARY_FINGERPRINTS);
+  const ca = caPortal || reconSummary;
   if (ws && ca) {
     return {
       role: 'recon',
@@ -237,6 +255,11 @@ export function classifyWorkbook(parsed) {
       caRows: ca.rows,
       wsSheet: ws.sheetName,
       caSheet: ca.sheetName,
+      // The recon's own balance date (summary sheet "Balance Date"). It can run
+      // later than WS Balances' as-on date — a Monday recon carries Saturday's
+      // WS snapshot but Monday's bank balances — so a CA override is judged
+      // stale against whichever of the two is later.
+      balanceDate: reconSummary ? findFirstValue(reconSummary.rows, 'Balance Date') : '',
     };
   }
   const z2 = findTable(parsed, Z2_COLS);
@@ -252,13 +275,125 @@ export function classifyWorkbook(parsed) {
       hint: 'Found WS Balances data but no ICICI account sheet — the Bank Recon workbook needs both.',
     };
   }
-  if (ca) {
+  if (reconSummary) {
+    // A Bank Recon whose WS Balances sheet is missing, not yet pasted, or
+    // mis-headed: say so, rather than letting its balance tables pose as a
+    // Current Account export.
     return {
       role: 'unknown',
-      hint: 'Found ICICI account balances but no WS Balances sheet — the Bank Recon workbook needs both.',
+      hint:
+        'Found ICICI account balances but no WS Balances sheet — the Bank Recon workbook needs both. ' +
+        '(A raw ICICI portal export on its own is accepted as Current Account Data.)',
+    };
+  }
+  if (caPortal) {
+    return {
+      role: 'ca',
+      caRows: caPortal.rows,
+      sheet: caPortal.sheetName,
+      exportedAt: findCurrentAccountExportDate(parsed),
     };
   }
   return { role: 'unknown' };
+}
+
+/** First fingerprint (in order) that locates a table in the workbook. */
+function findFirstTable(parsed, fingerprints) {
+  for (const cols of fingerprints) {
+    const table = findTable(parsed, cols);
+    if (table) return table;
+  }
+  return null;
+}
+
+/** First non-empty value of a column across rows (case-insensitive key). */
+function findFirstValue(rows, ...keys) {
+  for (const row of rows) {
+    const value = str(getField(row, ...keys));
+    if (value) return value;
+  }
+  return '';
+}
+
+/**
+ * The ICICI portal export ends with a footer row — "Date and Time: " in one
+ * cell and "08-05-2026     13:38:59" in the next (or both in one cell).
+ * Returns that stamp with whitespace collapsed, or '' when there is none.
+ * Scans every row of every sheet: the footer sits BELOW the data, outside
+ * findTable's header-scan window.
+ */
+export function findCurrentAccountExportDate(parsed) {
+  const grids = parsed?.grids || {};
+  for (const sheetName of parsed?.sheetNames || Object.keys(grids)) {
+    for (const row of grids[sheetName] || []) {
+      const cells = (row || []).map((c) => String(c ?? '').trim());
+      const idx = cells.findIndex((c) => /^date\s*(and|&)\s*time\b/i.test(c));
+      if (idx === -1) continue;
+      const inline = cells[idx].replace(/^date\s*(and|&)\s*time\s*:?\s*/i, '');
+      const value = inline || cells.slice(idx + 1).find((c) => c !== '') || '';
+      if (value) return value.replace(/\s+/g, ' ');
+    }
+  }
+  return '';
+}
+
+const MONTH_INDEX = {
+  jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
+};
+
+/**
+ * Parses the date stamps the source files carry: WS Balances "AS ON DATE"
+ * (14/07/2026), the ICICI export footer (08-05-2026 13:38:59), ISO
+ * (2026-07-14), SheetJS's default m/d/yy rendering of true date cells
+ * (7/14/26), and month-name renderings of d-mmm-yy style cells ("14-Jul-26",
+ * "14-Jul-2026", "Jul 14, 2026"). Numeric dates are day-first whenever the
+ * year has 4 digits; a 2-digit year is read month-first unless the first field
+ * can only be a day. Returns a UTC-midnight Date, or null when the text isn't
+ * a real calendar date.
+ */
+export function parseSourceDate(value) {
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+  const text = str(value);
+  const numeric = text.match(/^(\d{1,4})[-\/.](\d{1,2})[-\/.](\d{1,4})(?!\d)/);
+  const dayFirstNamed = text.match(/^(\d{1,2})[-\/ .]+([A-Za-z]{3,9})[-\/ .,]+(\d{2}|\d{4})(?!\d)/);
+  const monthFirstNamed = text.match(/^([A-Za-z]{3,9})[-\/ .]+(\d{1,2})[-\/ .,]+(\d{2}|\d{4})(?!\d)/);
+  let y, mo, d;
+  if (numeric) {
+    const [a, b, c] = [numeric[1], numeric[2], numeric[3]].map(Number);
+    if (numeric[1].length === 4) {
+      [y, mo, d] = [a, b, c];
+    } else if (numeric[3].length === 4) {
+      [d, mo, y] = [a, b, c];
+    } else if (numeric[3].length === 2 && numeric[1].length <= 2) {
+      y = 2000 + c;
+      if (a > 12) [d, mo] = [a, b];
+      else [mo, d] = [a, b];
+    } else {
+      return null;
+    }
+  } else if (dayFirstNamed || monthFirstNamed) {
+    const [dayText, monthText, yearText] = dayFirstNamed
+      ? [dayFirstNamed[1], dayFirstNamed[2], dayFirstNamed[3]]
+      : [monthFirstNamed[2], monthFirstNamed[1], monthFirstNamed[3]];
+    mo = MONTH_INDEX[monthText.slice(0, 3).toLowerCase()];
+    if (!mo) return null;
+    d = Number(dayText);
+    y = yearText.length === 2 ? 2000 + Number(yearText) : Number(yearText);
+  } else {
+    return null;
+  }
+  if (mo < 1 || mo > 12 || d < 1 || d > 31) return null;
+  const date = new Date(Date.UTC(y, mo - 1, d));
+  const valid =
+    date.getUTCFullYear() === y && date.getUTCMonth() === mo - 1 && date.getUTCDate() === d;
+  return valid ? date : null;
+}
+
+/** dd/mm/yyyy — the format ops read the WS Balances as-on date in. */
+function formatSourceDate(date) {
+  const dd = String(date.getUTCDate()).padStart(2, '0');
+  const mm = String(date.getUTCMonth() + 1).padStart(2, '0');
+  return `${dd}/${mm}/${date.getUTCFullYear()}`;
 }
 
 // -----------------------------------------------------------------------------
@@ -536,7 +671,9 @@ export function buildZ2Enrichment(z2Rows) {
  * This scans every row looking for one whose VALUES contain all of
  * requiredHeaders (case-insensitive).  Once found it builds a key-map
  * and returns only the data rows that follow, re-keyed to the canonical
- * header names.  Returns null if the header row cannot be found.
+ * header names — and to every other header on that row (Account Name,
+ * Effective Balance, …), so the result carries the same columns the
+ * findTable path provides.  Returns null if the header row cannot be found.
  */
 function reshapeByHeaderRow(rows, requiredHeaders) {
   for (let i = 0; i < rows.length; i++) {
@@ -555,6 +692,13 @@ function reshapeByHeaderRow(rows, requiredHeaders) {
     }
 
     if (Object.keys(keyMap).length === requiredHeaders.length) {
+      const mappedKeys = new Set(Object.values(keyMap));
+      for (const [k, v] of Object.entries(row)) {
+        const header = String(v ?? '').trim();
+        if (!header || mappedKeys.has(k) || header in keyMap) continue;
+        keyMap[header] = k;
+        mappedKeys.add(k);
+      }
       return rows
         .slice(i + 1)
         .map((row) => {
@@ -699,6 +843,11 @@ const CA_COLS = ['Account Number', 'Available Balance'];
  * enrichment — used to auto-fill missing RM names and resolve orphans.
  * manualMerges (optional) holds user-saved mappings of orphan balances onto
  * existing clients: { axisNames: { nameKey: wsCode }, accounts: { paddedAccount: wsCode } }.
+ * masterMeta: { fileName, sheetName } of the master source, plus optionally
+ * asOnDate (the WS Balances "AS ON DATE" text), reconBalanceDate (the recon
+ * summary sheet's "Balance Date" text) and currentAccount
+ * ({ fileName, sheetName, exportedAt }) when caRows came from a separately
+ * uploaded Current Account export rather than the recon's ICICI Balances sheet.
  */
 export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMeta = {}, z2Input = null, manualMerges = null) {
   const safeMaster = normalizeMasterRows(masterRows);
@@ -706,6 +855,13 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
   const safeCa = extractArray(caRows, ['ICICI Balances', 'ICICI Balance']);
   const cw = extractArray(cwRows);
   const z2 = buildZ2Enrichment(z2Input);
+  // Provenance of the ICICI balances: the separate Current Account export when
+  // one was uploaded, otherwise the master (Bank Recon) workbook.
+  const caMeta = masterMeta.currentAccount || null;
+  const balanceMeta = {
+    'Source File': (caMeta ? caMeta.fileName : masterMeta.fileName) || '',
+    'Sheet Name': (caMeta ? caMeta.sheetName : masterMeta.sheetName) || '',
+  };
 
   assertColumns(safeZ10, Z10_COLS, 'Z10');
 
@@ -1046,8 +1202,7 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
     exceptions.push({
       'Issue': 'ICICI Balance Without Master Record (auto-added)',
       'Master Row': '',
-      'Source File': masterMeta.fileName || '',
-      'Sheet Name': masterMeta.sheetName || '',
+      ...balanceMeta,
       'Client Code': '',
       'Client Name': info.accountName,
       'RM Name': '',
@@ -1171,7 +1326,7 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
       });
       exceptions.push({
         'Issue': 'ICICI Balance Without Master Record (auto-added)', 'Master Row': '',
-        'Source File': masterMeta.fileName || '', 'Sheet Name': masterMeta.sheetName || '',
+        ...balanceMeta,
         'Client Code': '', 'Client Name': p.accountName, 'RM Name': '', 'ICICI Acc. No.': p.account, 'Liquid MF Balance': '',
       });
     } else {
@@ -1214,6 +1369,36 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
     orphanAxisCash,
   };
 
+  if (caMeta) {
+    const source = caMeta.fileName ? `"${caMeta.fileName}"` : 'the Current Account Data file';
+    const exportDate = parseSourceDate(caMeta.exportedAt);
+    // Say outright when the export's age could not be checked, so a missing
+    // staleness warning is never mistaken for a clean bill of health.
+    const stamp = caMeta.exportedAt
+      ? ` (exported ${caMeta.exportedAt}${exportDate ? '' : ' — date not recognised, so its age was not checked'})`
+      : ' (no export date found in the file, so its age was not checked)';
+    warnings.push(
+      `ICICI balances taken from ${source}${stamp} instead of the Bank Recon's ICICI Balances sheet.`
+    );
+    // Reference = the recon's latest own date: WS Balances' as-on date or the
+    // recon summary's balance date, whichever is later (a Monday recon carries
+    // Saturday's WS snapshot but Monday's bank balances). A Current Account
+    // export older than that is almost certainly a stale download — the whole
+    // point of the override is fresher cash.
+    const reference = [
+      { label: 'WS Balances as-on date', date: parseSourceDate(masterMeta.asOnDate) },
+      { label: "Bank Recon's balance date", date: parseSourceDate(masterMeta.reconBalanceDate) },
+    ]
+      .filter((r) => r.date)
+      .sort((a, b) => b.date - a.date)[0];
+    if (exportDate && reference && exportDate < reference.date) {
+      warnings.push(
+        `Current Account Data was exported on ${formatSourceDate(exportDate)}, BEFORE the ` +
+        `${reference.label} (${formatSourceDate(reference.date)}) — these ICICI balances are ` +
+        `older than the recon. Download today's export from the ICICI portal.`
+      );
+    }
+  }
   if (testClientsExcluded > 0) {
     warnings.push(
       `Excluded ${testClientsExcluded} test client row(s) (RM "Test RM" / dummy account) from the tracker and totals.`
@@ -1284,7 +1469,11 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
     exceptions,
     autoResolved,
     finalMasterRows,
-    stats: { testClientsExcluded, rmFilledFromZ2 },
+    stats: {
+      testClientsExcluded,
+      rmFilledFromZ2,
+      balanceSource: caMeta ? 'current-account' : 'bank-recon',
+    },
     generatedAt: new Date(),
   };
 }
@@ -1296,7 +1485,9 @@ export function buildDailyTracker(masterRows, z10Rows, caRows, cwRows, masterMet
 /**
  * Builds the Client Master from WS Balances rows (Bank Recon export).
  * Bank account leading zeros are stripped so the account matches the
- * Current Account Data file exactly.
+ * Current Account Data file exactly. Also returns asOnDate — the WS Balances
+ * "AS ON DATE" text from the first populated row — so the build can compare
+ * it with a separately uploaded Current Account export.
  */
 export function buildDynamicMaster(wsBalancesRows, z10Rows) {
   const ws = extractArray(wsBalancesRows);
@@ -1317,9 +1508,11 @@ export function buildDynamicMaster(wsBalancesRows, z10Rows) {
 
   // 2. Build the master, pulling the RM name from the lookup
   const dynamicMaster = [];
+  let asOnDate = '';
   ws.forEach((r) => {
     const code = str(getField(r, 'CLIENT_CODE'));
     if (!code) return;
+    if (!asOnDate) asOnDate = str(getField(r, 'AS ON DATE', 'ASONDATE', 'AS_ON_DATE'));
 
     const rawBank = str(getField(r, 'BANK_ACCOUNT'));
     const bankCode = str(getField(r, 'BANK_CODE', 'BANKNAME')).toUpperCase();
@@ -1350,7 +1543,7 @@ export function buildDynamicMaster(wsBalancesRows, z10Rows) {
     });
   });
 
-  return { rows: dynamicMaster };
+  return { rows: dynamicMaster, asOnDate };
 }
 
 // -----------------------------------------------------------------------------

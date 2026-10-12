@@ -6,6 +6,8 @@ import {
   findTable,
   classifyWorkbook,
   mergeTrackerRows,
+  findCurrentAccountExportDate,
+  parseSourceDate,
 } from './liquidityProcessor';
 
 describe('normalizeAccount()', () => {
@@ -725,3 +727,335 @@ describe('buildDailyTracker() — manual merge resolution ordering', () => {
     expect(summary.totalIcici).toBe(5700); // money still present and conserved
   });
 })
+
+describe('classifyWorkbook() — balances-only Current Account export', () => {
+  // Shape of the raw ICICI portal download: two title rows, the table, a blank
+  // row, then a "Date and Time" footer.
+  const caWorkbook = {
+    kind: 'excel',
+    sheetNames: ['Sheet0'],
+    grids: {
+      Sheet0: [
+        ['                                OPERATIVE ACCOUNTS', '', '', '', ''],
+        [' OPERATIVE ACCOUNTS(2)', '', '', '', ''],
+        ['Account Number', 'Account Name', 'Currency', 'Available Balance', 'Effective Balance'],
+        ['000000001111', 'ALICE POA A/C', 'INR', '25000.00', '25000.00'],
+        ['000000002222', 'BOB POA A/C', 'INR', '10000.00', '7000.00'],
+        ['', '', '', '', ''],
+        ['Date and Time: ', '08-05-2026     13:38:59', '', '', ''],
+      ],
+    },
+  };
+
+  it('classifies the raw ICICI portal export as "ca" with its rows and export stamp', () => {
+    const cls = classifyWorkbook(caWorkbook);
+    expect(cls.role).toBe('ca');
+    expect(cls.sheet).toBe('Sheet0');
+    expect(cls.caRows[0]['Account Number']).toBe('000000001111');
+    expect(cls.caRows[1]['Effective Balance']).toBe('7000.00');
+    expect(cls.exportedAt).toBe('08-05-2026 13:38:59');
+  });
+
+  it('feeds the build exactly like the recon ICICI sheet does (footer row is inert)', () => {
+    const { caRows } = classifyWorkbook(caWorkbook);
+    const master = [
+      { 'WS Client Code': '100001', 'Client Name': 'Alice', 'RM Name': 'RM 1', 'ICICI Acc. No.': '1111' },
+      { 'WS Client Code': '100002', 'Client Name': 'Bob', 'RM Name': 'RM 1', 'ICICI Acc. No.': '2222' },
+    ];
+    const z10 = [{ 'WS CLIENT ID': '100001', 'SECURITY TYPE DESCRIPTION': 'Equity', 'ASTCLSNAME': 'Stock', 'MKTVALUE': '1' }];
+    const r = buildDailyTracker(master, z10, caRows, [], {}, null, null);
+    expect(r.rows.map((row) => row['ICICI Bank Balance'])).toEqual([25000, 7000]);
+    expect(r.summary.totalIcici).toBe(32000);
+    expect(r.exceptions).toHaveLength(0);
+  });
+
+  // Real recon summary sheet: space-padded headers, SheetJS m/d/yy dates.
+  const reconSummaryGrid = [
+    ['Bank Code', 'Balance Date', 'Bank Account', 'Client Name', ' Sum of Bank Balance (Custody) ', ' Adjustments ', ' Sum of Bank Balance (System) ', ' Diff ', ' In-Transit ', 'Remarks'],
+    ['ICICI', '7/14/26', '000000001111', 'ALICE POA A/C', ' 25,000.00 ', ' -   ', ' 25,000.00 ', ' -   ', ' -   ', 'No Action, Match'],
+  ];
+  const reconWorkbook = {
+    kind: 'excel',
+    sheetNames: ['Bank Recon 140726', 'WS Balances', 'ICICI Balances'],
+    grids: {
+      'Bank Recon 140726': reconSummaryGrid,
+      'WS Balances': [
+        ['CLIENT_CODE', 'CLIENTNAME', 'BANK_ACCOUNT', 'AS ON DATE'],
+        ['100001', 'Alice', '000000001111', '12/07/2026'],
+      ],
+      'ICICI Balances': caWorkbook.grids.Sheet0.slice(2, 5),
+    },
+  };
+
+  it('still classifies the full Bank Recon workbook as "recon", never "ca"', () => {
+    const cls = classifyWorkbook(reconWorkbook);
+    expect(cls.role).toBe('recon');
+    expect(cls.caSheet).toBe('ICICI Balances');
+    expect(cls.balanceDate).toBe('7/14/26');
+  });
+
+  it('leaves balanceDate empty for a recon without a summary sheet', () => {
+    const twoSheets = {
+      kind: 'excel',
+      sheetNames: ['WS Balances', 'ICICI Balances'],
+      grids: { 'WS Balances': reconWorkbook.grids['WS Balances'], 'ICICI Balances': reconWorkbook.grids['ICICI Balances'] },
+    };
+    const cls = classifyWorkbook(twoSheets);
+    expect(cls.role).toBe('recon');
+    expect(cls.balanceDate).toBe('');
+  });
+
+  it('rejects a Bank Recon whose WS Balances sheet is missing or mis-headed, with the old hint', () => {
+    const withoutWs = {
+      kind: 'excel',
+      sheetNames: ['Bank Recon 140726', 'ICICI Balances'],
+      grids: { 'Bank Recon 140726': reconSummaryGrid, 'ICICI Balances': reconWorkbook.grids['ICICI Balances'] },
+    };
+    const drifted = {
+      kind: 'excel',
+      sheetNames: reconWorkbook.sheetNames,
+      grids: {
+        ...reconWorkbook.grids,
+        'WS Balances': [['CLIENT CODE', 'CLIENTNAME', 'BANK_ACCOUNT'], ['100001', 'Alice', '000000001111']],
+      },
+    };
+    for (const wb of [withoutWs, drifted]) {
+      const cls = classifyWorkbook(wb);
+      expect(cls.role).toBe('unknown');
+      expect(cls.hint).toContain('no WS Balances sheet');
+    }
+  });
+
+  it('never accepts the recon summary sheet on its own as Current Account Data', () => {
+    const summaryOnly = { kind: 'excel', sheetNames: ['Bank Recon 140726'], grids: { 'Bank Recon 140726': reconSummaryGrid } };
+    const cls = classifyWorkbook(summaryOnly);
+    expect(cls.role).toBe('unknown');
+    expect(cls.hint).toContain('no WS Balances sheet');
+  });
+
+  it('reads the footer stamp of a full-size export, well past findTable\'s 40-row scan window', () => {
+    const accounts = Array.from({ length: 70 }, (_, i) => [
+      String(201113700 + i).padStart(12, '0'), `CLIENT ${i} POA A/C`, 'INR', '100.00', '100.00',
+    ]);
+    const bigExport = {
+      kind: 'excel',
+      sheetNames: ['Sheet0'],
+      grids: { Sheet0: [...caWorkbook.grids.Sheet0.slice(0, 3), ...accounts, ['', '', '', '', ''], ['Date and Time: ', '08-05-2026     13:38:59', '', '', '']] },
+    };
+    const cls = classifyWorkbook(bigExport);
+    expect(cls.role).toBe('ca');
+    expect(cls.caRows.filter((r) => /^\d{12}$/.test(r['Account Number']))).toHaveLength(70);
+    expect(cls.exportedAt).toBe('08-05-2026 13:38:59');
+  });
+
+  it('keeps the hint for a WS-Balances-only workbook', () => {
+    const wsOnly = {
+      kind: 'excel',
+      sheetNames: ['WS Balances'],
+      grids: { 'WS Balances': [['CLIENT_CODE', 'CLIENTNAME', 'BANK_ACCOUNT'], ['100001', 'Alice', '000000001111']] },
+    };
+    const cls = classifyWorkbook(wsOnly);
+    expect(cls.role).toBe('unknown');
+    expect(cls.hint).toContain('no ICICI account sheet');
+  });
+
+  it('returns an empty export stamp when the footer is missing', () => {
+    const noFooter = { kind: 'excel', sheetNames: ['S'], grids: { S: caWorkbook.grids.Sheet0.slice(0, 5) } };
+    expect(classifyWorkbook(noFooter).exportedAt).toBe('');
+    expect(findCurrentAccountExportDate(noFooter)).toBe('');
+  });
+
+  it('reads the footer stamp whether the label and value share a cell or not', () => {
+    const oneCell = { kind: 'grid', sheetNames: ['CSV'], grids: { CSV: [['x'], ['Date and Time: 11-05-2026 11:28:28']] } };
+    expect(findCurrentAccountExportDate(oneCell)).toBe('11-05-2026 11:28:28');
+    const twoCells = { kind: 'grid', sheetNames: ['CSV'], grids: { CSV: [['Date & Time', '', '27-04-2026   11:23:19']] } };
+    expect(findCurrentAccountExportDate(twoCells)).toBe('27-04-2026 11:23:19');
+  });
+});
+
+describe('parseSourceDate()', () => {
+  const iso = (d) => d.toISOString().slice(0, 10);
+
+  it('reads day-first dates with a 4-digit year (WS Balances / ICICI footer)', () => {
+    expect(iso(parseSourceDate('14/07/2026'))).toBe('2026-07-14');
+    expect(iso(parseSourceDate('08-05-2026 13:38:59'))).toBe('2026-05-08');
+    expect(iso(parseSourceDate('8-5-2026'))).toBe('2026-05-08');
+  });
+
+  it('reads ISO and SheetJS m/d/yy renderings of true date cells', () => {
+    expect(iso(parseSourceDate('2026-07-14'))).toBe('2026-07-14');
+    expect(iso(parseSourceDate('7/14/26'))).toBe('2026-07-14');
+    expect(iso(parseSourceDate('14/7/26'))).toBe('2026-07-14');
+  });
+
+  it('reads month-name renderings of d-mmm-yy style cells', () => {
+    expect(iso(parseSourceDate('14-Jul-26'))).toBe('2026-07-14');
+    expect(iso(parseSourceDate('14-Jul-2026'))).toBe('2026-07-14');
+    expect(iso(parseSourceDate('8-May-26 19:08'))).toBe('2026-05-08');
+    expect(iso(parseSourceDate('14 July 2026'))).toBe('2026-07-14');
+    expect(iso(parseSourceDate('Jul 14, 2026'))).toBe('2026-07-14');
+    expect(iso(parseSourceDate('1-Sept-2026'))).toBe('2026-09-01');
+    expect(parseSourceDate('14-Foo-2026')).toBeNull();
+  });
+
+  it('passes Date instances through and rejects blanks, text and impossible dates', () => {
+    const d = new Date(Date.UTC(2026, 6, 14));
+    expect(parseSourceDate(d)).toBe(d);
+    expect(parseSourceDate('')).toBeNull();
+    expect(parseSourceDate(undefined)).toBeNull();
+    expect(parseSourceDate(null)).toBeNull();
+    expect(parseSourceDate('as on date')).toBeNull();
+    expect(parseSourceDate('31/02/2026')).toBeNull();
+    expect(parseSourceDate('14/13/2026')).toBeNull();
+    expect(parseSourceDate('08-05-20261')).toBeNull();
+  });
+});
+
+describe('buildDynamicMaster() — as-on date', () => {
+  it('returns the WS Balances AS ON DATE from the first populated client row', () => {
+    const { asOnDate } = buildDynamicMaster(
+      [
+        { CLIENT_CODE: '', CLIENTNAME: '', BANK_ACCOUNT: '', 'AS ON DATE': '01/01/2000' },
+        { CLIENT_CODE: '100001', CLIENTNAME: 'Alice', BANK_ACCOUNT: '000000001111', 'AS ON DATE': '' },
+        { CLIENT_CODE: '100002', CLIENTNAME: 'Bob', BANK_ACCOUNT: '000000002222', 'AS ON DATE': '14/07/2026' },
+      ],
+      []
+    );
+    expect(asOnDate).toBe('14/07/2026');
+  });
+
+  it('returns an empty as-on date when the column is absent', () => {
+    const { rows, asOnDate } = buildDynamicMaster(
+      [{ CLIENT_CODE: '100001', CLIENTNAME: 'Alice', BANK_ACCOUNT: '000000001111' }],
+      []
+    );
+    expect(rows).toHaveLength(1);
+    expect(asOnDate).toBe('');
+  });
+});
+
+describe('buildDailyTracker() — Current Account Data override', () => {
+  const master = [
+    { 'WS Client Code': '100001', 'Client Name': 'Alice Corp', 'RM Name': 'Smith, John', 'ICICI Acc. No.': '1111' },
+  ];
+  const z10 = [
+    { 'WS CLIENT ID': '100001', 'SECURITY TYPE DESCRIPTION': 'Mutual Funds', 'ASTCLSNAME': 'Cash', 'MKTVALUE': '1000' },
+  ];
+  const ca = [
+    { 'Account Number': '000000001111', 'Account Name': 'ALICE POA A/C', 'Available Balance': '25000', 'Effective Balance': '25000' },
+    { 'Account Number': '000000009999', 'Account Name': 'ORPHAN POA A/C', 'Available Balance': '500', 'Effective Balance': '500' },
+  ];
+  const cw = [{ 'Client Name': 'ALICE CORP', 'Ledger Bal BOD': '0' }];
+  const reconMeta = { fileName: 'Bank Recon_140726.xlsx', sheetName: 'WS Balances', asOnDate: '14/07/2026' };
+  const withCa = (exportedAt) => ({
+    ...reconMeta,
+    currentAccount: { fileName: 'CurrentAccountdata (16).xlsx', sheetName: 'Sheet0', exportedAt },
+  });
+  const orphanOf = (r) => r.exceptions.find((e) => e['Issue'].startsWith('ICICI Balance Without Master Record'));
+  const hasStale = (r) => r.warnings.some((w) => w.includes('BEFORE the WS Balances as-on date'));
+
+  it('reports the recon as the balance source when no Current Account file is given', () => {
+    const r = buildDailyTracker(master, z10, ca, cw, reconMeta, null, null);
+    expect(r.stats.balanceSource).toBe('bank-recon');
+    expect(r.warnings.some((w) => w.includes('ICICI balances taken from'))).toBe(false);
+    expect(hasStale(r)).toBe(false);
+    expect(orphanOf(r)['Source File']).toBe('Bank Recon_140726.xlsx');
+    expect(orphanOf(r)['Sheet Name']).toBe('WS Balances');
+  });
+
+  it('names the Current Account file as the balance source and attributes ICICI orphans to it', () => {
+    const r = buildDailyTracker(master, z10, ca, cw, withCa('15-07-2026 09:12:00'), null, null);
+    expect(r.stats.balanceSource).toBe('current-account');
+    const note = r.warnings.find((w) => w.startsWith('ICICI balances taken from'));
+    expect(note).toBe(
+      'ICICI balances taken from "CurrentAccountdata (16).xlsx" (exported 15-07-2026 09:12:00) ' +
+        "instead of the Bank Recon's ICICI Balances sheet."
+    );
+    expect(hasStale(r)).toBe(false);
+    expect(orphanOf(r)['Source File']).toBe('CurrentAccountdata (16).xlsx');
+    expect(orphanOf(r)['Sheet Name']).toBe('Sheet0');
+    // Only provenance changes — the numbers are what the recon path would give.
+    expect(r.summary.totalIcici).toBe(25500);
+    expect(r.rows[0]['ICICI Bank Balance']).toBe(25000);
+  });
+
+  it('warns when the Current Account export predates the WS Balances as-on date', () => {
+    const r = buildDailyTracker(master, z10, ca, cw, withCa('08-05-2026 13:38:59'), null, null);
+    const stale = r.warnings.find((w) => w.includes('BEFORE the WS Balances as-on date'));
+    expect(stale).toContain('08/05/2026');
+    expect(stale).toContain('14/07/2026');
+  });
+
+  it('does not warn on a same-day or newer export, or when either date is unreadable', () => {
+    expect(hasStale(buildDailyTracker(master, z10, ca, cw, withCa('14-07-2026 18:00:00'), null, null))).toBe(false);
+    expect(hasStale(buildDailyTracker(master, z10, ca, cw, withCa('15/07/2026'), null, null))).toBe(false);
+    expect(hasStale(buildDailyTracker(master, z10, ca, cw, withCa(''), null, null))).toBe(false);
+    const noAsOn = { ...withCa('08-05-2026 13:38:59'), asOnDate: '' };
+    expect(hasStale(buildDailyTracker(master, z10, ca, cw, noAsOn, null, null))).toBe(false);
+  });
+
+  it('judges staleness against the later of the WS as-on date and the recon balance date, naming it', () => {
+    // Monday recon: WS snapshot Sat 25/07, bank balances Mon 27/07 (SheetJS m/d/yy).
+    const mondayRecon = { ...withCa('26-07-2026 08:00:00'), asOnDate: '25/07/2026', reconBalanceDate: '7/27/26' };
+    const stale = buildDailyTracker(master, z10, ca, cw, mondayRecon, null, null).warnings.find((w) => w.includes('BEFORE'));
+    expect(stale).toContain("BEFORE the Bank Recon's balance date (27/07/2026)");
+    // Same export is fine once it is on or after the recon's balance date.
+    const fresh = { ...mondayRecon, currentAccount: { ...mondayRecon.currentAccount, exportedAt: '27-07-2026 09:30:00' } };
+    expect(buildDailyTracker(master, z10, ca, cw, fresh, null, null).warnings.some((w) => w.includes('BEFORE'))).toBe(false);
+    // A recon balance date EARLIER than the WS as-on date never lowers the bar.
+    const earlierSummary = { ...withCa('13-07-2026 08:00:00'), asOnDate: '14/07/2026', reconBalanceDate: '7/10/26' };
+    expect(buildDailyTracker(master, z10, ca, cw, earlierSummary, null, null).warnings.find((w) => w.includes('BEFORE'))).toContain(
+      'BEFORE the WS Balances as-on date (14/07/2026)'
+    );
+  });
+
+  it('says so when the export date is missing or unreadable instead of staying silent', () => {
+    const noStamp = buildDailyTracker(master, z10, ca, cw, withCa(''), null, null).warnings.find((w) => w.startsWith('ICICI balances taken from'));
+    expect(noStamp).toContain('no export date found in the file, so its age was not checked');
+    const oddStamp = buildDailyTracker(master, z10, ca, cw, withCa('yesterday'), null, null).warnings.find((w) => w.startsWith('ICICI balances taken from'));
+    expect(oddStamp).toContain('(exported yesterday — date not recognised, so its age was not checked)');
+    expect(hasStale(buildDailyTracker(master, z10, ca, cw, withCa('yesterday'), null, null))).toBe(false);
+  });
+
+  it('keeps master-row and Axis exceptions attributed to the recon when a Current Account file is present', () => {
+    const wider = [
+      ...master,
+      { 'WS Client Code': '100002', 'Client Name': 'Bob LLC', 'RM Name': 'Doe, Jane', 'ICICI Acc. No.': '3333' },
+      { 'WS Client Code': '100003', 'Client Name': 'Carol Ltd', 'RM Name': '', 'ICICI Acc. No.': 'N/A' },
+    ];
+    const cwWider = [...cw, { 'Client Name': 'DAVE ORPHAN', 'Ledger Bal BOD': '700' }];
+    const r = buildDailyTracker(wider, z10, ca, cwWider, withCa('15-07-2026 09:12:00'), null, null);
+    const byIssue = (issue) => r.exceptions.find((e) => e['Issue'].startsWith(issue));
+    const notFound = byIssue('Current Account Not Found In ICICI Balances');
+    expect(notFound['Client Code']).toBe('100002');
+    expect(notFound['Master Row']).toBe(3);
+    for (const exc of [notFound, byIssue('Missing RM Name'), byIssue('Axis Demat Balance Without Master Record')]) {
+      expect(exc['Source File']).toBe('Bank Recon_140726.xlsx');
+      expect(exc['Sheet Name']).toBe('WS Balances');
+    }
+    expect(orphanOf(r)['Source File']).toBe('CurrentAccountdata (16).xlsx');
+  });
+
+  it('builds the same tracker from raw parseFile-style rows (title rows, __EMPTY keys) as from classifier rows', () => {
+    // What XLSX.utils.sheet_to_json() yields for the portal export when the first row is taken as the header.
+    const raw = [
+      { 'OPERATIVE ACCOUNTS': ' OPERATIVE ACCOUNTS(2)' },
+      { 'OPERATIVE ACCOUNTS': 'Account Number', __EMPTY: 'Account Name', __EMPTY_1: 'Currency', __EMPTY_2: 'Available Balance', __EMPTY_3: 'Effective Balance' },
+      { 'OPERATIVE ACCOUNTS': '000000001111', __EMPTY: 'ALICE POA A/C', __EMPTY_1: 'INR', __EMPTY_2: '99999', __EMPTY_3: '25000' },
+      { 'OPERATIVE ACCOUNTS': '000000009999', __EMPTY: 'ORPHAN POA A/C', __EMPTY_1: 'INR', __EMPTY_2: '99999', __EMPTY_3: '500' },
+      { 'OPERATIVE ACCOUNTS': 'Date and Time: ', __EMPTY: '08-05-2026     13:38:59' },
+    ];
+    const viaRaw = buildDailyTracker(master, z10, raw, cw, reconMeta, null, null);
+    const viaClassifier = buildDailyTracker(master, z10, ca, cw, reconMeta, null, null);
+    expect(viaRaw.summary.totalIcici).toBe(viaClassifier.summary.totalIcici); // Effective, not Available
+    expect(viaRaw.rows).toEqual(viaClassifier.rows);
+    expect(orphanOf(viaRaw)['Client Name']).toBe('ORPHAN POA A/C');
+  });
+
+  it('attributes a stale saved-mapping fallback orphan to the Current Account file too', () => {
+    const merges = { axisNames: {}, accounts: { '000000009999': '100999' } }; // target code no longer exists
+    const r = buildDailyTracker(master, z10, ca, cw, withCa('15-07-2026 09:12:00'), null, merges);
+    expect(orphanOf(r)['Source File']).toBe('CurrentAccountdata (16).xlsx');
+    expect(r.summary.totalIcici).toBe(25500);
+  });
+});
